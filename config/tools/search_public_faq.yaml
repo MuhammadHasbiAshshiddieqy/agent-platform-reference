@@ -1,0 +1,28 @@
+# §21/ADR-011 — the one deliberately external-audience tool. Proves the
+# HARNESS_AUDIENCE filter actually excludes tools (every other manifest in
+# this directory is audience:[internal] only), not just that the filter
+# exists in code. See services/harness/src/harness/tools/executor.py for
+# why this tool routes to retrieval-service instead of mock-business-api
+# (domain: faq is a signal, not a real business-api URL prefix).
+name: search_public_faq
+version: 1
+kind: readonly
+audience: [external, internal]
+risk_level: low
+
+description_for_model: >
+  Mencari jawaban dari FAQ publik perusahaan (kebijakan yang boleh
+  diketahui pihak luar). Tidak memberikan akses ke data karyawan atau
+  HRIS internal apa pun.
+
+parameters_schema: SearchPublicFaqParams
+domain: faq
+business_action: search_public_faq
+
+required_permissions: []
+data_scope: tenant
+
+required_scopes_for_token_exchange: []
+
+cacheable: true
+audit_level: summary

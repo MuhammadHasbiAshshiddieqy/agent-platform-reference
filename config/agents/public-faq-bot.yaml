@@ -1,0 +1,20 @@
+# §21/ADR-011's external-audience agent profile — not deployed by default
+# (`make up` only runs harness-internal, per ADR-011's "hanya deploy
+# harness-internal di POC"), but real enough to boot a `harness-external`
+# instance against for the one test that proves the audience split
+# actually works (tests/harness_external/).
+agent_id: public-faq-bot
+audience: external
+version: 1
+model:
+  sync: agent-cheap
+  async: agent-cheap
+  classifier: agent-cheap
+allowed_tools:
+  - search_public_faq
+guardrails:
+  input: [pii_redaction, injection_detection]
+  output: [policy]
+cacheable: true
+cache_ttl_seconds: 3600
+max_iterations: 4

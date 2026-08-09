@@ -1,0 +1,26 @@
+# §22.7 — the design-time ceiling. `allowed_tools` here is never exceeded
+# no matter how high a user's real permissions are: an hr_manager using
+# this profile still can't reach a tool that isn't listed, because tool
+# manifests aren't the only gate — this file is the other one (§22.1's
+# intersection).
+agent_id: hr-assistant
+audience: internal
+version: 1
+model:
+  sync: agent-primary
+  async: agent-primary
+  classifier: agent-cheap
+allowed_tools:
+  - get_leave_balance
+  - submit_leave_request
+  - adjust_payroll
+retrieval:
+  collections: [documents_internal_v1]
+  top_k: 8
+  rerank: true
+guardrails:
+  input: [pii_redaction, injection_detection, off_topic]
+  output: [groundedness, pii_leakage, policy]
+cacheable: true
+cache_ttl_seconds: 3600
+max_iterations: 8

@@ -1,0 +1,37 @@
+name: adjust_payroll
+version: 1
+kind: mutation
+audience: [internal]
+risk_level: high  # always — never escalated conditionally, see api/payroll.py
+
+description_for_model: >
+  Menyesuaikan gaji karyawan. Selalu memerlukan persetujuan manusia
+  sebelum efektif — jangan gunakan tool ini untuk sekadar melihat gaji.
+
+parameters_schema: AdjustPayrollParams
+domain: payroll
+business_action: adjust_payroll
+
+required_permissions:
+  - payroll.adjust
+
+# tenant, not self — an hr_manager adjusts payroll for any employee in
+# the tenant, not just their own record (§22.2's own worked example for
+# why data_scope isn't a duplicate of required_permissions).
+data_scope: tenant
+
+required_scopes_for_token_exchange:
+  - payroll:write
+
+rate_limit:
+  per_user_per_hour: 5
+  per_tenant_per_hour: 50
+
+# Statically high risk (no escalate_to_high_when condition needed) — the
+# approver permission still has to be declared somewhere for the approval
+# endpoint to check, so it's a top-level field rather than nested under a
+# conditional rule that doesn't apply here.
+approver_permission: payroll.adjust
+
+cacheable: false
+audit_level: full

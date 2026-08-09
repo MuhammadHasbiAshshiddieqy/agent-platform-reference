@@ -1,0 +1,35 @@
+{
+  "leave_balances": {
+    "emp_001": 8,
+    "emp_002": 12,
+    "emp_003": 10,
+    "emp_004": 6,
+    "emp_005": 9,
+    "emp_006": 10,
+    "emp_007": 11,
+    "emp_008": 7,
+    "emp_009": 12,
+    "emp_010": 8,
+    "emp_011": 9,
+    "emp_012": 10,
+    "emp_013": 11,
+    "emp_014": 8,
+    "emp_015": 9,
+    "emp_016": 10,
+    "emp_017": 7,
+    "emp_018": 12,
+    "emp_019": 8,
+    "emp_020": 9,
+    "emp_101": 8,
+    "emp_201": 8,
+    "emp_202": 12,
+    "emp_203": 10,
+    "emp_204": 6
+  },
+  "leave_requests": [],
+  "actions": [
+    "get_leave_balance",
+    "submit_leave_request",
+    "adjust_payroll"
+  ]
+}

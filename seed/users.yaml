@@ -1,0 +1,331 @@
+# §26.1 demo seed data. Read directly by mock-idp (M5b) AND mock-business-api
+# (M5) — never copied into either service (ADR-009, §27.1, §28.10): if the
+# two ever had separate copies, "what the agent may ask for" and "what
+# business-api will actually allow" would drift apart, and the demo would
+# fail in a way that's confusing to debug.
+#
+# Permission sets follow the role table in §22.3, which is written as
+# cumulative ("+" per row). Two judgment calls made filling that table in
+# for concrete users (not one of the §0 mandatory stop-and-ask areas, but
+# worth flagging):
+#   - `employee` includes `leave.balance.read` (self) even though §22.3's
+#     table only lists it starting at `team_lead` (team scope) — demo step
+#     1 (§26.2) has an `employee` call get_leave_balance for themselves, so
+#     the self-scope grant has to exist somewhere.
+#   - `finance` is NOT given hr_manager's `payroll.adjust`/`employee.read`
+#     despite the table's cumulative "+" notation implying it might — an
+#     employee approving reimbursements has no business adjusting payroll
+#     or reading arbitrary HR records. Treated as illustrative shorthand,
+#     not literal role inheritance across unrelated business functions.
+
+tenants:
+  - tenant_id: tnt_demo
+    description: Primary demo tenant (§26.2 — all eight demo steps run here)
+  - tenant_id: tnt_eval
+    description: eval-service tenant (§13.1, §13.7) — separate corpus, impersonation only allowed here
+  - tenant_id: tnt_other
+    description: Isolation control tenant (§26.1) — 1 user, 1 document, proves tenant isolation, never appears in the demo script itself
+
+users:
+  - user_id: usr_budi
+    tenant_id: tnt_demo
+    name: Budi Santoso
+    employee_id: emp_001
+    role: employee
+    department_id: dep_eng
+    acl_group_ids: [grp_all_staff, grp_engineering]
+    permissions: [policy.read, leave.balance.read, leave.request.create, payslip.read]
+    leave_balance: 8
+
+  - user_id: usr_siti
+    tenant_id: tnt_demo
+    name: Siti Rahayu
+    employee_id: emp_002
+    role: team_lead
+    department_id: dep_eng
+    acl_group_ids: [grp_all_staff, grp_engineering]
+    permissions: [policy.read, leave.balance.read, leave.request.create, payslip.read, leave.request.approve]
+    scope_context:
+      team_member_ids: [emp_001, emp_005]
+      department_id: dep_eng
+    leave_balance: 12
+
+  - user_id: usr_andi
+    tenant_id: tnt_demo
+    name: Andi Wijaya
+    employee_id: emp_003
+    role: hr_manager
+    department_id: dep_hr
+    acl_group_ids: [grp_all_staff, grp_hr]
+    permissions:
+      [
+        policy.read,
+        leave.balance.read,
+        leave.request.create,
+        payslip.read,
+        leave.request.approve,
+        employee.read,
+        leave.request.adjust,
+        payroll.adjust,
+      ]
+    scope_context:
+      department_id: dep_hr
+    leave_balance: 10
+
+  - user_id: usr_dewi
+    tenant_id: tnt_demo
+    name: Dewi Lestari
+    employee_id: emp_004
+    role: finance
+    department_id: dep_finance
+    acl_group_ids: [grp_all_staff, grp_finance]
+    permissions: [policy.read, leave.balance.read, leave.request.create, payslip.read, payroll.read, reimbursement.approve]
+    scope_context:
+      department_id: dep_finance
+    leave_balance: 6
+
+  - user_id: usr_eko
+    tenant_id: tnt_demo
+    name: Eko Prasetyo
+    employee_id: emp_005
+    role: employee
+    department_id: dep_eng
+    # Deliberately identical ACL set to usr_budi — §26.1 uses this pair to
+    # prove semantic cache hits are allowed *across* users sharing an
+    # acl_hash (§10), while usr_dewi (different ACL groups) must miss.
+    acl_group_ids: [grp_all_staff, grp_engineering]
+    permissions: [policy.read, leave.balance.read, leave.request.create, payslip.read]
+    leave_balance: 9
+
+  # emp_006..emp_020 — 15 generated employees so data_scope (§22.2) means
+  # something: `self`/`team`/`department` are meaningless with 5 users
+  # spread across 3 departments where everyone already knows everyone.
+  - user_id: usr_gen_006
+    tenant_id: tnt_demo
+    name: Rina Wulandari
+    employee_id: emp_006
+    role: employee
+    department_id: dep_eng
+    acl_group_ids: [grp_all_staff, grp_engineering]
+    permissions: [policy.read, leave.balance.read, leave.request.create, payslip.read]
+    leave_balance: 10
+  - user_id: usr_gen_007
+    tenant_id: tnt_demo
+    name: Fajar Nugroho
+    employee_id: emp_007
+    role: employee
+    department_id: dep_eng
+    acl_group_ids: [grp_all_staff, grp_engineering]
+    permissions: [policy.read, leave.balance.read, leave.request.create, payslip.read]
+    leave_balance: 11
+  - user_id: usr_gen_008
+    tenant_id: tnt_demo
+    name: Maya Kusuma
+    employee_id: emp_008
+    role: employee
+    department_id: dep_eng
+    acl_group_ids: [grp_all_staff, grp_engineering]
+    permissions: [policy.read, leave.balance.read, leave.request.create, payslip.read]
+    leave_balance: 7
+  - user_id: usr_gen_009
+    tenant_id: tnt_demo
+    name: Bayu Saputra
+    employee_id: emp_009
+    role: employee
+    department_id: dep_eng
+    acl_group_ids: [grp_all_staff, grp_engineering]
+    permissions: [policy.read, leave.balance.read, leave.request.create, payslip.read]
+    leave_balance: 12
+  - user_id: usr_gen_010
+    tenant_id: tnt_demo
+    name: Putri Handayani
+    employee_id: emp_010
+    role: employee
+    department_id: dep_eng
+    acl_group_ids: [grp_all_staff, grp_engineering]
+    permissions: [policy.read, leave.balance.read, leave.request.create, payslip.read]
+    leave_balance: 8
+  - user_id: usr_gen_011
+    tenant_id: tnt_demo
+    name: Agus Setiawan
+    employee_id: emp_011
+    role: employee
+    department_id: dep_hr
+    acl_group_ids: [grp_all_staff, grp_hr]
+    permissions: [policy.read, leave.balance.read, leave.request.create, payslip.read]
+    leave_balance: 9
+  - user_id: usr_gen_012
+    tenant_id: tnt_demo
+    name: Indah Permata
+    employee_id: emp_012
+    role: employee
+    department_id: dep_hr
+    acl_group_ids: [grp_all_staff, grp_hr]
+    permissions: [policy.read, leave.balance.read, leave.request.create, payslip.read]
+    leave_balance: 10
+  - user_id: usr_gen_013
+    tenant_id: tnt_demo
+    name: Yusuf Ramadhan
+    employee_id: emp_013
+    role: employee
+    department_id: dep_hr
+    acl_group_ids: [grp_all_staff, grp_hr]
+    permissions: [policy.read, leave.balance.read, leave.request.create, payslip.read]
+    leave_balance: 11
+  - user_id: usr_gen_014
+    tenant_id: tnt_demo
+    name: Sri Wahyuni
+    employee_id: emp_014
+    role: employee
+    department_id: dep_hr
+    acl_group_ids: [grp_all_staff, grp_hr]
+    permissions: [policy.read, leave.balance.read, leave.request.create, payslip.read]
+    leave_balance: 8
+  - user_id: usr_gen_015
+    tenant_id: tnt_demo
+    name: Dian Anggraini
+    employee_id: emp_015
+    role: employee
+    department_id: dep_finance
+    acl_group_ids: [grp_all_staff, grp_finance]
+    permissions: [policy.read, leave.balance.read, leave.request.create, payslip.read]
+    leave_balance: 9
+  - user_id: usr_gen_016
+    tenant_id: tnt_demo
+    name: Hendra Gunawan
+    employee_id: emp_016
+    role: employee
+    department_id: dep_finance
+    acl_group_ids: [grp_all_staff, grp_finance]
+    permissions: [policy.read, leave.balance.read, leave.request.create, payslip.read]
+    leave_balance: 10
+  - user_id: usr_gen_017
+    tenant_id: tnt_demo
+    name: Lestari Ningsih
+    employee_id: emp_017
+    role: employee
+    department_id: dep_finance
+    acl_group_ids: [grp_all_staff, grp_finance]
+    permissions: [policy.read, leave.balance.read, leave.request.create, payslip.read]
+    leave_balance: 7
+  - user_id: usr_gen_018
+    tenant_id: tnt_demo
+    name: Arif Rahman
+    employee_id: emp_018
+    role: employee
+    department_id: dep_eng
+    acl_group_ids: [grp_all_staff, grp_engineering]
+    permissions: [policy.read, leave.balance.read, leave.request.create, payslip.read]
+    leave_balance: 12
+  - user_id: usr_gen_019
+    tenant_id: tnt_demo
+    name: Novita Sari
+    employee_id: emp_019
+    role: employee
+    department_id: dep_eng
+    acl_group_ids: [grp_all_staff, grp_engineering]
+    permissions: [policy.read, leave.balance.read, leave.request.create, payslip.read]
+    leave_balance: 8
+  - user_id: usr_gen_020
+    tenant_id: tnt_demo
+    name: Taufik Hidayat
+    employee_id: emp_020
+    role: employee
+    department_id: dep_eng
+    acl_group_ids: [grp_all_staff, grp_engineering]
+    permissions: [policy.read, leave.balance.read, leave.request.create, payslip.read]
+    leave_balance: 9
+
+  # tnt_other — isolation control (§26.1). Never referenced by the demo
+  # script; exists purely so tests/security can prove a tnt_demo user
+  # cannot see this user's data through any path (RAG, cache, history, jobs).
+  - user_id: usr_other_employee
+    tenant_id: tnt_other
+    name: Citra Maharani
+    employee_id: emp_101
+    role: employee
+    department_id: dep_other
+    acl_group_ids: [grp_all_staff]
+    permissions: [policy.read, leave.balance.read, leave.request.create]
+    leave_balance: 8
+
+  # tnt_eval — §13.7's eval-service actors. Mirrors tnt_demo's role
+  # diversity (employee/team_lead/hr_manager/finance) so `eval.items`
+  # can exercise the same RBAC/mutation/refusal surface without ever
+  # running eval traffic as a real demo user — `POST /oauth/eval-
+  # impersonate` (mock-idp) is the only path allowed to mint tokens for
+  # these, and only because they're in EVAL_TENANT_IDS.
+  - user_id: usr_eval_employee
+    tenant_id: tnt_eval
+    name: Eval Employee
+    employee_id: emp_201
+    role: employee
+    department_id: dep_eval
+    acl_group_ids: [grp_all_staff, grp_eval]
+    permissions: [policy.read, leave.balance.read, leave.request.create, payslip.read]
+    leave_balance: 8
+
+  - user_id: usr_eval_teamlead
+    tenant_id: tnt_eval
+    name: Eval Team Lead
+    employee_id: emp_202
+    role: team_lead
+    department_id: dep_eval
+    acl_group_ids: [grp_all_staff, grp_eval]
+    permissions: [policy.read, leave.balance.read, leave.request.create, payslip.read, leave.request.approve]
+    scope_context:
+      team_member_ids: [emp_201]
+      department_id: dep_eval
+    leave_balance: 12
+
+  - user_id: usr_eval_hr_manager
+    tenant_id: tnt_eval
+    name: Eval HR Manager
+    employee_id: emp_203
+    role: hr_manager
+    department_id: dep_eval
+    acl_group_ids: [grp_all_staff, grp_eval]
+    permissions:
+      [
+        policy.read,
+        leave.balance.read,
+        leave.request.create,
+        payslip.read,
+        leave.request.approve,
+        employee.read,
+        leave.request.adjust,
+        payroll.adjust,
+      ]
+    scope_context:
+      department_id: dep_eval
+    leave_balance: 10
+
+  - user_id: usr_eval_finance
+    tenant_id: tnt_eval
+    name: Eval Finance
+    employee_id: emp_204
+    role: finance
+    department_id: dep_eval
+    acl_group_ids: [grp_all_staff, grp_eval]
+    permissions: [policy.read, leave.balance.read, leave.request.create, payslip.read, payroll.read, reimbursement.approve]
+    scope_context:
+      department_id: dep_eval
+    leave_balance: 6
+
+departments:
+  - department_id: dep_eng
+    name: Engineering
+    tenant_id: tnt_demo
+  - department_id: dep_hr
+    name: HR
+    tenant_id: tnt_demo
+  - department_id: dep_finance
+    name: Finance
+    tenant_id: tnt_demo
+  - department_id: dep_other
+    name: Other Co.
+    tenant_id: tnt_other
+  - department_id: dep_eval
+    name: Eval
+    tenant_id: tnt_eval
+    tenant_id: tnt_other

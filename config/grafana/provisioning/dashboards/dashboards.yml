@@ -1,0 +1,14 @@
+apiVersion: 1
+
+providers:
+  - name: Duta
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      # Dashboard JSON files land in this same directory (§12.4 alert
+      # dashboards are added at M9). Grafana's file provisioner only
+      # loads *.json, so this provider's own .yml is safely ignored.
+      path: /etc/grafana/provisioning/dashboards

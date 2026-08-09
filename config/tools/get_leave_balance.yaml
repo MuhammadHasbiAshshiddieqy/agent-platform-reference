@@ -1,0 +1,32 @@
+# §22.2 — declares an entire tool. Ter-version, ter-review, ter-diff (git),
+# never a database row. Loaded by services/harness/src/harness/authz/manifest.py
+# at boot, filtered to HARNESS_AUDIENCE, cached for the process lifetime.
+name: get_leave_balance
+version: 1
+kind: readonly
+audience: [internal]
+risk_level: low
+
+description_for_model: >
+  Cek sisa saldo cuti karyawan. employee_id akan otomatis diarahkan ke
+  karyawan yang sedang bertanya — tidak perlu (dan tidak bisa) mengecek
+  saldo cuti orang lain dengan tool ini.
+
+parameters_schema: GetLeaveBalanceParams
+# domain: not in §22.2's literal sample — added because business_action
+# alone doesn't tell the client which business-api URL prefix to use
+# (/hr/v1/... vs /payroll/v1/...); see manifest.py's ToolManifestEntry
+# docstring.
+domain: hr
+business_action: get_leave_balance
+
+required_permissions:
+  - leave.balance.read
+
+data_scope: self
+scope_param: employee_id
+
+required_scopes_for_token_exchange: []
+
+cacheable: false
+audit_level: full

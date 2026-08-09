@@ -1,0 +1,40 @@
+# §9.2 output policy row: rule-based, versioned with code, tested with
+# positive/negative cases in tests/unit/test_policy.py (§9.2's own
+# requirement). Keyword matching is case-insensitive substring — simple
+# on purpose; a reference implementation's policy layer should be legible
+# to a non-engineer reviewer, not a hidden ML classifier.
+rules:
+  - rule_id: legal_promise
+    severity: high
+    action: block
+    keywords:
+      - "dijamin secara hukum"
+      - "kontrak yang mengikat secara hukum"
+      - "kami menjamin secara hukum"
+      - "secara hukum kami wajib"
+      - "legally binding"
+      - "legally guarantee"
+
+  - rule_id: financial_commitment
+    severity: high
+    action: block
+    keywords:
+      - "kami akan membayar"
+      - "dijamin cair"
+      - "pasti cair"
+      - "kami jamin pencairan"
+      - "kami pastikan dana akan"
+      - "we guarantee payment"
+      - "we will pay you"
+
+  - rule_id: medical_advice
+    severity: high
+    action: block
+    keywords:
+      - "diagnosis anda adalah"
+      - "anda didiagnosis"
+      - "anda menderita penyakit"
+      - "resep obat"
+      - "dosis obat yang tepat"
+      - "you have been diagnosed"
+      - "your diagnosis is"

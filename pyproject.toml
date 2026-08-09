@@ -1,0 +1,97 @@
+[project]
+name = "agent-platform-reference"
+version = "0.1.0"
+description = "Duta — production AI agent platform reference implementation"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+# Globs: every service and shared package is a workspace member. New
+# services (services/gateway, services/harness, ...) join automatically
+# as they're created in later milestones — no edit needed here.
+members = ["packages/*", "services/*"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "import-linter>=2.1",
+    "testcontainers[postgres]>=4.8",
+    "alembic>=1.13",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.29",
+    "psycopg[binary]>=3.2",
+    "pyyaml>=6.0",
+    "httpx>=0.27",
+    "pyjwt>=2.9",
+    "types-pyyaml>=6.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# docs/SPEC.md is a contract (§0), not source we own the style of — ruff
+# format touches embedded ```python fences in Markdown by default, which
+# would turn "explain the spec" diffs into "reformat the spec" noise.
+extend-exclude = ["docs/"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true
+# Each service's src/ is its own package root (not a namespace package
+# shared with site-packages) — without explicit_package_bases, mypy
+# discovers `harness` twice (once via mypy_path, once via the editable
+# install in .venv) and refuses to check anything ("Source file found
+# twice under different module names"). Grows with every new service.
+explicit_package_bases = true
+mypy_path = [
+    "packages/contracts/src",
+    "services/harness/src",
+    "services/gateway/src",
+    "services/ingestion/src",
+    "services/retrieval/src",
+    "services/mock-business-api/src",
+    "services/mock-idp/src",
+    "services/async-worker/src",
+    "services/eval/src",
+]
+
+# langfuse (v2 SDK) ships no py.typed marker — targeted, not a blanket
+# ignore-missing-imports, so a real typo in a *different* untyped import
+# still fails loudly.
+[[tool.mypy.overrides]]
+module = "langfuse.*"
+ignore_missing_imports = true
+
+# ragas 0.2.15 ships no py.typed marker either.
+[[tool.mypy.overrides]]
+module = "ragas.*"
+ignore_missing_imports = true
+
+# §4.1 — service independence boundary, enforced by `lint-imports`.
+# root_packages/contracts grow here as each service is scaffolded
+# (M1: gateway, harness; M3: retrieval, ingestion; M6: worker; M8: eval).
+# Keep this list in sync with services/ — a service missing here is a
+# service whose import boundary nothing is checking.
+[tool.importlinter]
+root_packages = ["contracts", "harness", "gateway", "ingestion", "retrieval", "mock_business_api", "mock_idp", "async_worker", "eval_service"]
+
+[[tool.importlinter.contracts]]
+name = "Contracts tidak bergantung pada service"
+type = "forbidden"
+source_modules = ["contracts"]
+forbidden_modules = ["harness", "gateway", "ingestion", "retrieval", "mock_business_api", "mock_idp", "async_worker", "eval_service"]
+
+[[tool.importlinter.contracts]]
+name = "Service tidak saling impor"
+type = "independence"
+modules = ["harness", "gateway", "ingestion", "retrieval", "mock_business_api", "mock_idp", "async_worker", "eval_service"]

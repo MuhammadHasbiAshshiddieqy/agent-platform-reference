@@ -1,0 +1,74 @@
+_format_version: "3.0"
+
+# §5.1 — Kong is the only component that terminates external traffic; JWT
+# validation happens here (§7.1). The gateway re-verifies the same JWT
+# independently (services/gateway/src/gateway/auth.py) rather than trust
+# Kong's word for it — the same "no service trusts its caller blindly"
+# principle §8.4 states for business-api.
+#
+# The secret below is a fixed, publicly-known DEV-ONLY value — it must be
+# wrong to use in production, so it's written in plain text rather than
+# via a vault reference. It stands in for mock-idp's JWKS/RS256 (M5b,
+# §28.10 ADR-009). It MUST match JWT_SIGNING_SECRET in .env. Kong's `jwt`
+# plugin looks up a consumer by the JWT's `iss` claim, not by username —
+# every minted JWT must carry `"iss": "duta-demo"` to match the key below.
+consumers:
+  - username: demo-tenant
+    jwt_secrets:
+      - key: duta-demo
+        algorithm: HS256
+        secret: duta-dev-jwt-signing-secret-never-use-in-production
+    plugins:
+      # L1 (§6): request/sec abuse-and-DDoS ceiling, per API key/consumer
+      # — coarse and cheap, unaware of token cost. L2 (agent-gateway's
+      # QuotaManager, §23.2a) is the real cost control; this just stops
+      # someone from hammering the edge. `policy: local` is fine for a
+      # single Kong node; move to `redis` if Kong is ever scaled out.
+      - name: rate-limiting
+        config:
+          minute: 100
+          policy: local
+
+services:
+  - name: agent-gateway
+    url: http://agent-gateway:8080
+    # Matches agent-gateway's SYNC_TIMEOUT_SECONDS override for this dev
+    # machine's slow CPU-only local inference (deploy/docker-compose.yml).
+    # M3's RAG path chained embed -> rerank -> generate on top of the
+    # plain LLM call M1 was tuned for (60s -> 100s here). M4's guardrail
+    # pipeline added up to four more real `agent-cheap` calls in the same
+    # request (100s -> 150s). M5's tool-calling loop (`respond` <-> `act`,
+    # bounded by MAX_TOOL_ITERATIONS) adds up to two more real
+    # `agent-primary` calls — manual testing found `agent-local`
+    # (qwen2.5:3b, this dev machine's fallback with no GEMINI_API_KEY)
+    # sometimes re-requests an already-answered tool instead of finishing
+    # with text (real model-capability noise, see CLAUDE.md), which the
+    # iteration bound caps but doesn't make instant — so this needed a
+    # fourth bump (150s -> 220s). Give Kong a little more room so it never
+    # cuts the connection a moment before the gateway's own timeout logic
+    # would.
+    read_timeout: 225000
+    write_timeout: 225000
+    connect_timeout: 5000
+    routes:
+      - name: agent-gateway-v1
+        paths: ["/v1"]
+        strip_path: false
+    plugins:
+      - name: jwt
+      - name: correlation-id
+        config:
+          header_name: X-Trace-Id
+          generator: uuid
+          echo_downstream: true
+
+  # Health checks bypass JWT — same upstream, a route with no plugins.
+  - name: agent-gateway-health
+    url: http://agent-gateway:8080
+    routes:
+      - name: agent-gateway-health-route
+        paths: ["/healthz", "/readyz"]
+        strip_path: false
+
+plugins:
+  - name: prometheus

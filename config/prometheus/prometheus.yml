@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: agent-gateway
+    static_configs:
+      - targets: ["agent-gateway:8080"]
+
+  # Remaining scrape targets are added here as each service starts
+  # exporting the §12.2 metric set:
+  #   agent-harness:8081     (no metrics endpoint yet)
+  #   retrieval-service:8082 (M3)
+  #   ingestion-service:8083 (M3)
+  #   async-worker:8085      (M6)

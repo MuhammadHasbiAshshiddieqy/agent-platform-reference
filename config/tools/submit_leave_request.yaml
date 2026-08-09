@@ -1,0 +1,39 @@
+name: submit_leave_request
+version: 1
+kind: mutation
+audience: [internal]
+risk_level: medium
+
+description_for_model: >
+  Mengajukan permohonan cuti untuk karyawan yang sedang bertanya. Gunakan
+  hanya setelah memverifikasi sisa saldo cuti dengan tool get_leave_balance.
+  Permohonan lebih dari 5 hari kerja memerlukan persetujuan atasan.
+
+parameters_schema: SubmitLeaveRequestParams
+domain: hr
+business_action: submit_leave_request
+
+required_permissions:
+  - leave.request.create
+
+data_scope: self
+scope_param: employee_id
+
+required_scopes_for_token_exchange:
+  - leave:write
+
+rate_limit:
+  per_user_per_hour: 10
+  per_tenant_per_hour: 500
+
+# §8.4/§22.2 — mirrors mock-business-api's own escalation rule
+# (LEAVE_DAYS_HIGH_RISK_THRESHOLD, api/hr.py); duplicated intentionally,
+# not read from business-api at manifest-load time, so the tool schema
+# offered to the model and the actual risk decision agree without a
+# runtime dependency between the two services at boot.
+escalate_to_high_when:
+  - condition: "params.leave_days > 5"
+    approver_permission: leave.request.approve
+
+cacheable: false
+audit_level: full

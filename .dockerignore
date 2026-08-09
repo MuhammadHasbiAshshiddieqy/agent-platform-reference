@@ -1,0 +1,27 @@
+# Every service Dockerfile builds with the repo root as context (§17) —
+# without this file, every `docker compose build` ships the whole repo
+# (including every service's .venv, caches, and .git history) to the
+# daemon on every build, even though only a couple of paths get COPY'd.
+
+.git/
+.venv/
+**/.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.mypy_cache/
+**/.mypy_cache/
+.ruff_cache/
+**/.ruff_cache/
+.pytest_cache/
+**/.pytest_cache/
+.import_linter_cache/
+.pytest_cache/
+node_modules/
+
+# Local-only, never needed inside a build
+.env
+*.log
+
+# Big, irrelevant to any image build
+docs/proposal.pdf

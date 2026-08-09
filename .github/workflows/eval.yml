@@ -1,0 +1,74 @@
+# §13.8's CI eval gate. Triggers only on changes to the surfaces eval
+# actually exercises — the same paths a real prompt/tool/config change
+# would touch — not on every PR, matching §13.6's cost/time budget.
+name: eval
+
+on:
+  pull_request:
+    paths:
+      - "services/harness/**"
+      - "config/agents/**"
+      - "config/tools/**"
+      - "config/model-router/**"
+      - "seed/eval/**"
+      - "seed/documents/**"
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: cp .env.example .env
+      # §13.7 needs the real stack — quota, idempotency, and guardrails
+      # all genuinely exercised, not the harness in isolation.
+      - run: make up-eval
+      - run: make migrate
+      - run: curl -sf -X POST http://localhost:8083/internal/v1/ingest/tnt_eval
+      - run: make eval-smoke
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: eval-smoke-report, path: reports/ }
+
+  full:
+    if: github.base_ref == 'main'
+    needs: smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: cp .env.example .env
+      - run: make up-eval
+      - run: make migrate
+      - run: curl -sf -X POST http://localhost:8083/internal/v1/ingest/tnt_eval
+      - run: make eval-full
+      - name: comment on PR
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DATABASE_URL="postgresql+asyncpg://agent_app:$(grep ^APP_DB_PASSWORD .env | cut -d= -f2)@localhost:5432/agent_platform" \
+          MODEL_ROUTER_KEY="$(grep ^LITELLM_MASTER_KEY .env | cut -d= -f2)" \
+            uv run --package eval-service python -m eval_service.report --tier full --comment-pr ${{ github.event.number }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: eval-full-report, path: reports/ }
+
+  # §13.8/§13.9: "baseline diperbarui otomatis setelah merge ke main" —
+  # a genuinely separate job, triggered by the merge itself rather than
+  # by a PR gate, and only ever promotes a run that already passed.
+  promote-baseline:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: cp .env.example .env
+      - run: make up-eval
+      - run: make migrate
+      - run: curl -sf -X POST http://localhost:8083/internal/v1/ingest/tnt_eval
+      - run: make eval-full
+      - run: |
+          DATABASE_URL="postgresql+asyncpg://agent_app:$(grep ^APP_DB_PASSWORD .env | cut -d= -f2)@localhost:5432/agent_platform" \
+          MODEL_ROUTER_KEY="$(grep ^LITELLM_MASTER_KEY .env | cut -d= -f2)" \
+            uv run --package eval-service python -m eval_service.gate --tier full --promote-baseline --changed-by "${{ github.actor }}"

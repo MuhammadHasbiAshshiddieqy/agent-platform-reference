@@ -1,0 +1,72 @@
+# LiteLLM Proxy config — §5.4 + §28.2 (ADR-001). This is config, not an
+# application: the router is the single place model provider names are
+# allowed to appear (§4.1 rule 3). Application code only ever references
+# the `model_name` aliases below — grep for `gemini/`, `anthropic/`,
+# `openai/`, or `ollama/` in services/ or packages/ must return nothing.
+
+model_list:
+  - model_name: agent-primary
+    litellm_params:
+      model: gemini/gemini-3.6-flash
+      api_key: os.environ/GEMINI_API_KEY
+      rpm: 8 # stay under the free-tier per-minute ceiling (§28.7)
+  - model_name: agent-cheap
+    litellm_params:
+      model: gemini/gemini-3.5-flash-lite
+      api_key: os.environ/GEMINI_API_KEY
+      rpm: 12
+  - model_name: agent-local # fallback + load test (§28.7)
+    litellm_params:
+      # qwen2.5:3b, not the spec's qwen2.5:7b: on a Docker Desktop VM
+      # capped at 7.75GB (this dev machine), loading the 7b model's
+      # ~4.7GB weights left too little headroom once postgres, langfuse's
+      # stack, kong, and model-router were all running too — Ollama's
+      # llama-server got OOM-killed mid-load every time (confirmed via
+      # `free -h` inside the VM: <3.5GB available, swap exhausted). 3b
+      # loads in ~4s with plenty of headroom. If your Docker VM has more
+      # RAM, switch back to 7b for closer fidelity to §28.2/§28.7.
+      model: ollama/qwen2.5:3b
+      api_base: http://ollama:11434
+  - model_name: eval-judge # ADR-012 — local, so it can't share bias with agent-primary
+    litellm_params:
+      # qwen2.5:3b, not the spec's qwen2.5:14b, and (after a live
+      # attempt) not the 7b this file originally tried either. 7b was
+      # live-tested as `eval-judge` running an actual eval smoke tier
+      # (16 items, real gateway calls) and reliably OOM-killed Ollama's
+      # `llama-server` mid-run (`"llama-server process has terminated:
+      # signal: killed"`, confirmed via `docker inspect`) — the same
+      # class of finding `agent-local`'s own comment documents for the
+      # exact same 7b model, just triggered here by judge calls running
+      # *concurrently alongside* `agent-local`'s own 3b calls for the
+      # thing actually being judged (both hitting Ollama's one shared
+      # CPU-only process at once), not by 7b in isolation. This dev
+      # machine's ~7.75GB Docker VM ceiling cannot hold two loaded Ollama
+      # models plus the rest of the stack (`infinity`, `model-router`,
+      # `kong`, ...) at once. Falling back to 3b means `eval-judge` and
+      # `agent-local` are, in THIS dev environment only, the same model
+      # instance — a real, documented compromise of ADR-012's "judge
+      # must not be the model being judged" principle, not a silent one.
+      # The alias indirection this file exists to provide is still what
+      # makes the fix a one-line config change: point this at 14b (or a
+      # real API-backed judge) on a machine with more Docker VM memory,
+      # or once `GEMINI_API_KEY` is set, with zero application code
+      # touched either way.
+      model: ollama/qwen2.5:3b
+      api_base: http://ollama:11434
+  - model_name: embedding-default
+    litellm_params:
+      model: openai/BAAI/bge-m3 # Infinity speaks the OpenAI embeddings API
+      api_base: http://infinity:7997
+      api_key: dummy
+
+router_settings:
+  routing_strategy: usage-based-routing-v2
+  num_retries: 2
+  timeout: 60
+  fallbacks:
+    - agent-primary: ["agent-local"] # free-tier quota exhausted -> keep serving locally
+    - agent-cheap: ["agent-local"]
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/LITELLM_DATABASE_URL

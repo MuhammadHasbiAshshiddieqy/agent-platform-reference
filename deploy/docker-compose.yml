@@ -1,0 +1,635 @@
+# M0: infra only. M1 (§15) adds the minimal sync path — model-router,
+# agent-harness, agent-gateway, kong. retrieval, ingestion, worker, eval,
+# mock-idp, mock-business-api still don't exist — added as each milestone
+# builds them (§27.1).
+#
+# Run from repo root via `make up` (which does `docker compose -f
+# deploy/docker-compose.yml --env-file .env up -d`), not directly from
+# inside deploy/ — build contexts and env-file paths assume repo root as cwd.
+name: mekari-agent-platform
+
+services:
+  # ---------------------------------------------------------------------
+  # postgres — system of record (§5.6) AND vector store (§5.8, ADR-002).
+  # One instance, three logical databases (agent_platform, litellm,
+  # langfuse), created once by deploy/postgres/init.sql on first boot.
+  # ---------------------------------------------------------------------
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: agent_platform
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent -d agent_platform"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------
+  # redis — app cache/counter (§5.7): quota, semantic cache, idempotency,
+  # locks, Celery result backend. Never shared with Langfuse's redis (§17).
+  # ---------------------------------------------------------------------
+  redis:
+    image: redis/redis-stack-server:latest
+    restart: unless-stopped
+    ports: ["6379:6379"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------
+  # rabbitmq — async job broker (§5.9). Queue topology (standard/bulk/DLQ)
+  # is declared by agent-gateway/async-worker at M6, not here.
+  # ---------------------------------------------------------------------
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    restart: unless-stopped
+    ports: ["5672:5672", "15672:15672"]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  # ---------------------------------------------------------------------
+  # infinity — embedding (BAAI/bge-m3) + reranking (bge-reranker-base, see
+  # note below) in one CPU container (ADR-006, §28.3). No SDK for either
+  # model imported anywhere outside retrieval-service/ingestion-service.
+  # ---------------------------------------------------------------------
+  infinity:
+    image: michaelf34/infinity:latest-cpu
+    # amd64-only image (no arm64 manifest as of writing) — runs under
+    # emulation on Apple Silicon. Slower cold start, functionally fine.
+    platform: linux/amd64
+    restart: unless-stopped
+    ports: ["7997:7997"]
+    # bge-reranker-base, not -v2-m3 (§28.3's own documented contingency):
+    # loading two transformer models simultaneously under amd64 emulation
+    # spikes memory hard enough during the bettertransformer optimization
+    # pass to crash-loop this container on a stock 7-8GB Docker Desktop VM
+    # (observed: clean exit code 0 mid-load, repeatedly, no OOMKilled flag
+    # — a VM-level OOM kill Docker doesn't always attribute cleanly).
+    # bge-reranker-base is smaller and faster at a small quality cost;
+    # switch back to -v2-m3 if your Docker VM has more headroom.
+    command: >
+      v2
+      --model-id BAAI/bge-m3
+      --model-id BAAI/bge-reranker-base
+      --engine torch
+      --port 7997
+    volumes:
+      - infinitycache:/app/.cache
+
+  # ---------------------------------------------------------------------
+  # ollama — agent-local (fallback + load test) and eval-judge (§28.2,
+  # §28.7, ADR-012). `make seed` pulls qwen2.5:7b / qwen2.5:14b into this.
+  # ---------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports: ["11434:11434"]
+    volumes:
+      - ollamadata:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  # ---------------------------------------------------------------------
+  # Langfuse v3 self-host (§5.13, §17 note, §28.8) — needs its own
+  # ClickHouse, MinIO (S3-compatible blob store) and Redis. None of these
+  # four are shared with the application stack above.
+  # ---------------------------------------------------------------------
+  langfuse-redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_AUTH: ${LANGFUSE_REDIS_AUTH:?set LANGFUSE_REDIS_AUTH in .env}
+    command: >
+      --requirepass ${LANGFUSE_REDIS_AUTH:?set LANGFUSE_REDIS_AUTH in .env}
+      --maxmemory-policy noeviction
+    volumes:
+      - langfuse_redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_AUTH\" ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24-alpine
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}
+    ports: ["8123:8123"]
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      # 127.0.0.1, not localhost — the alpine image resolves localhost to
+      # ::1 first and clickhouse-server only binds 0.0.0.0 (IPv4), so the
+      # IPv6 attempt refuses and the healthcheck flaps unhealthy.
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+    ports: ["9000:9000", "9001:9001"]
+    volumes:
+      - langfuse_minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    restart: unless-stopped
+    depends_on: &langfuse-depends-on
+      postgres: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      langfuse-redis: {condition: service_healthy}
+      clickhouse: {condition: service_healthy}
+    ports: ["3030:3030"]
+    environment: &langfuse-env
+      NEXTAUTH_URL: http://localhost:3000
+      DATABASE_URL: postgresql://agent:${POSTGRES_PASSWORD}@postgres:5432/langfuse
+      SALT: ${LANGFUSE_SALT:?set LANGFUSE_SALT in .env}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:?set LANGFUSE_ENCRYPTION_KEY in .env, e.g. openssl rand -hex 32}
+      TELEMETRY_ENABLED: "false"
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+      REDIS_HOST: langfuse-redis
+      REDIS_PORT: "6379"
+      REDIS_AUTH: ${LANGFUSE_REDIS_AUTH}
+      REDIS_TLS_ENABLED: "false"
+
+  langfuse:
+    image: langfuse/langfuse:3
+    restart: unless-stopped
+    depends_on: *langfuse-depends-on
+    ports: ["3000:3000"]
+    environment:
+      <<: *langfuse-env
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:?set NEXTAUTH_SECRET in .env}
+      # Auto-provision an org/project/user/API-key-pair at first boot
+      # instead of manual UI signup — harness (M1) authenticates with the
+      # exact same PROJECT_PUBLIC_KEY/PROJECT_SECRET_KEY (§12.1).
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD}
+
+  # ---------------------------------------------------------------------
+  # Observability infra (§5.14). Scrape targets / dashboards are added as
+  # each service starts exporting the §12.2 metric set.
+  # ---------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    ports: ["9090:9090"]
+    volumes:
+      - ../config/prometheus:/etc/prometheus:ro
+      - prometheusdata:/prometheus
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    ports: ["3001:3000"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+    volumes:
+      - grafanadata:/var/lib/grafana
+      - ../config/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on: [prometheus]
+
+  # ---------------------------------------------------------------------
+  # M1 — minimal sync path (§15). model-router is config + LiteLLM only
+  # (§5.4); harness/gateway are this repo's first two application images.
+  # ---------------------------------------------------------------------
+  model-router:
+    build: { context: .., dockerfile: config/model-router/Dockerfile }
+    restart: unless-stopped
+    ports: ["4000:4000"]
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY in .env}
+      LITELLM_DATABASE_URL: postgresql://agent:${POSTGRES_PASSWORD}@postgres:5432/litellm
+      # Empty is fine — agent-primary/agent-cheap fall through to
+      # agent-local via the router's own fallback config (§28.7).
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    depends_on:
+      postgres: { condition: service_healthy }
+      ollama: { condition: service_healthy }
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # ---------------------------------------------------------------------
+  # M3 — RAG (§15). retrieval-service is the read side (§5.5); ingestion-
+  # service is the write side (§5.11). Both talk to model-router for
+  # embeddings (embedding-default alias) and go straight to Infinity only
+  # for reranking, which model-router has no abstraction for (§28.3).
+  # ---------------------------------------------------------------------
+  retrieval-service:
+    build: { context: .., dockerfile: services/retrieval/Dockerfile }
+    restart: unless-stopped
+    ports: ["8082:8082"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://agent_app:${APP_DB_PASSWORD}@postgres:5432/agent_platform
+      MODEL_ROUTER_URL: http://model-router:4000
+      MODEL_ROUTER_KEY: ${LITELLM_MASTER_KEY}
+      INFINITY_URL: http://infinity:7997
+      RERANK_MODEL: BAAI/bge-reranker-base # see infinity's note on -v2-m3
+    depends_on:
+      postgres: { condition: service_healthy }
+      model-router: { condition: service_healthy }
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8082/healthz')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  ingestion-service:
+    build: { context: .., dockerfile: services/ingestion/Dockerfile }
+    restart: unless-stopped
+    ports: ["8083:8083"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://agent_app:${APP_DB_PASSWORD}@postgres:5432/agent_platform
+      MODEL_ROUTER_URL: http://model-router:4000
+      MODEL_ROUTER_KEY: ${LITELLM_MASTER_KEY}
+      DOCUMENTS_DIR: /seed/documents
+      HARNESS_URL: http://agent-harness:8081
+    volumes:
+      - ../seed:/seed:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+      model-router: { condition: service_healthy }
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8083/healthz')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  mock-business-api:
+    build: { context: .., dockerfile: services/mock-business-api/Dockerfile }
+    restart: unless-stopped
+    ports: ["8084:8084"]
+    # §21.2's "yang membuat ini aman bukan policy engine, melainkan
+    # network policy" — deliberately NOT on `default`, only on
+    # `hris_internal`. `agent-harness` (internal) joins both; the
+    # `agent-harness-external` profile below joins only `default`, so it
+    # cannot resolve or reach this hostname at all — proven, not just
+    # policy-asserted (ADR-011's third required assertion).
+    networks: [hris_internal]
+    environment:
+      # §22.5 step 5 — independent verification of mock-idp's downscoped
+      # token, same shared secret Kong/gateway/mock-idp all use.
+      JWT_SIGNING_SECRET: ${JWT_SIGNING_SECRET:?set JWT_SIGNING_SECRET in .env}
+    # Bind-mounted (not just baked into the image at build time) so
+    # `make reset`-style edits to business_state.json don't need a
+    # rebuild — same reasoning as ingestion-service's seed/documents
+    # mount above.
+    volumes:
+      - ../seed/business_state.json:/app/seed/business_state.json:ro
+      - ../seed/users.yaml:/app/seed/users.yaml:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8084/healthz')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  mock-idp:
+    build: { context: .., dockerfile: services/mock-idp/Dockerfile }
+    restart: unless-stopped
+    ports: ["8087:8087"]
+    environment:
+      JWT_SIGNING_SECRET: ${JWT_SIGNING_SECRET:?set JWT_SIGNING_SECRET in .env}
+      # §13.7 — must match agent-harness's own EVAL_TENANT_IDS below;
+      # the only tenant `/oauth/eval-impersonate` will mint tokens for.
+      EVAL_TENANT_IDS: tnt_eval
+    volumes:
+      - ../seed/users.yaml:/app/seed/users.yaml:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8087/healthz')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  agent-harness:
+    build: { context: .., dockerfile: services/harness/Dockerfile }
+    restart: unless-stopped
+    ports: ["8081:8081"]
+    # `default` (everything else) + `hris_internal` (mock-business-api,
+    # internal-only) — the internal deployment needs both.
+    networks: [default, hris_internal]
+    environment:
+      # agent_app, never `agent` (CLAUDE.md boundary #4) — RLS is a no-op
+      # for the migration superuser.
+      DATABASE_URL: postgresql+asyncpg://agent_app:${APP_DB_PASSWORD}@postgres:5432/agent_platform
+      MODEL_ROUTER_URL: http://model-router:4000
+      MODEL_ROUTER_KEY: ${LITELLM_MASTER_KEY}
+      RETRIEVAL_URL: http://retrieval-service:8082
+      BUSINESS_API_URL: http://mock-business-api:8084
+      MOCK_IDP_URL: http://mock-idp:8087
+      # §21/ADR-011 — only `internal` is deployed in the default stack;
+      # `harness-external` (docker-compose --profile external-test) sets
+      # this to `external` and points at the same config/ directory.
+      HARNESS_AUDIENCE: internal
+      # §5.7 keyspace convention — db 2, distinct from gateway's db 1
+      # (quota). §22.6 killswitch reads live here.
+      REDIS_URL: redis://redis:6379/2
+      # §10 semantic cache — db 0, NOT db 2 above: RediSearch's
+      # FT.CREATE/FT.SEARCH only work on logical db 0 (cache/store.py's
+      # docstring has the confirmed error text from db 2/1).
+      SEMANTIC_CACHE_REDIS_URL: redis://redis:6379/0
+      # §13.1 — must match mock-idp's own EVAL_TENANT_IDS above; harness
+      # is the sole authority on whether to honor `X-Eval-Mode` (see
+      # contracts.harness.AgentRunRequest.eval_mode_requested's docstring).
+      EVAL_TENANT_IDS: tnt_eval
+      LANGFUSE_HOST: http://langfuse:3000
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY}
+    # Bind-mounted so `config/tools/*.yaml`/`config/agents/*.yaml` edits
+    # don't need a rebuild — same reasoning as mock-business-api's seed
+    # mount above (CLAUDE.md's own quirk about baked-in files not
+    # hot-reloading on a plain `restart` applies to a rebuild-only COPY
+    # just as much as it does to model-router's config.yaml).
+    volumes:
+      - ../config/tools:/app/config/tools:ro
+      - ../config/agents:/app/config/agents:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      model-router: { condition: service_healthy }
+      retrieval-service: { condition: service_healthy }
+      mock-business-api: { condition: service_healthy }
+      mock-idp: { condition: service_healthy }
+      langfuse: { condition: service_started }
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8081/healthz')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # §21/ADR-011 — the same image, `HARNESS_AUDIENCE=external`, not started
+  # by default (`make up` never brings this up — "hanya deploy harness-
+  # internal di POC"). Start it explicitly to prove the audience split:
+  #   docker compose --profile external-test up -d agent-harness-external
+  # Deliberately NOT on `hris_internal` — it structurally cannot resolve
+  # `mock-business-api`, matching the internal-vs-external table in §21.2
+  # ("Tidak punya rute jaringan ke HRIS/payroll sama sekali"). It also
+  # never gets a manifest reference to it: `load_tool_manifests` for
+  # `audience=external` only ever returns `search_public_faq`, which has
+  # no `business_action` route through `BusinessApiClient` at all — see
+  # tools/executor.py's `domain == "faq"` branch.
+  agent-harness-external:
+    profiles: ["external-test"]
+    build: { context: .., dockerfile: services/harness/Dockerfile }
+    restart: "no"
+    ports: ["8091:8081"]
+    networks: [default]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://agent_app:${APP_DB_PASSWORD}@postgres:5432/agent_platform
+      MODEL_ROUTER_URL: http://model-router:4000
+      MODEL_ROUTER_KEY: ${LITELLM_MASTER_KEY}
+      RETRIEVAL_URL: http://retrieval-service:8082
+      # BUSINESS_API_URL deliberately left at its default (still resolves
+      # to `mock-business-api`, a hostname this container's `hris_internal`-
+      # less network membership can never actually reach) — `BusinessApiClient`
+      # is still constructed here like every deployment, it's just never
+      # called: `search_public_faq` is the only tool `HARNESS_AUDIENCE=
+      # external` ever loads, and its `domain == "faq"` routes to
+      # retrieval-service, never to business-api (tools/executor.py).
+      MOCK_IDP_URL: http://mock-idp:8087
+      HARNESS_AUDIENCE: external
+      REDIS_URL: redis://redis:6379/3
+      LANGFUSE_HOST: http://langfuse:3000
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY}
+    volumes:
+      - ../config/tools:/app/config/tools:ro
+      - ../config/agents:/app/config/agents:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      model-router: { condition: service_healthy }
+      retrieval-service: { condition: service_healthy }
+      mock-idp: { condition: service_healthy }
+      langfuse: { condition: service_started }
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8081/healthz')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  agent-gateway:
+    build: { context: .., dockerfile: services/gateway/Dockerfile }
+    restart: unless-stopped
+    ports: ["8080:8080"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://agent_app:${APP_DB_PASSWORD}@postgres:5432/agent_platform
+      HARNESS_URL: http://agent-harness:8081
+      # §14 specifies 30s; bumped for this dev machine specifically —
+      # CPU-only local Ollama inference (agent-local, config/model-router/
+      # config.yaml) under the full stack's combined resource contention
+      # on a ~7.75GB Docker VM occasionally exceeds 30s. A GPU-backed or
+      # cloud provider (agent-primary with a real GEMINI_API_KEY) doesn't
+      # need this — set back to 30 once Gemini quota is available.
+      SYNC_TIMEOUT_SECONDS: "220"
+      JWT_SIGNING_SECRET: ${JWT_SIGNING_SECRET:?set JWT_SIGNING_SECRET in .env}
+      # db 1 — distinct from harness's future cache use (§5.7, §17 ref).
+      REDIS_URL: redis://redis:6379/1
+      # §5.9 — gateway only ever publishes to the exchange; async-worker
+      # owns the actual queue/DLX/retry topology.
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      agent-harness: { condition: service_healthy }
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  async-worker:
+    build: { context: .., dockerfile: services/async-worker/Dockerfile }
+    restart: unless-stopped
+    ports: ["8085:8085"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://agent_app:${APP_DB_PASSWORD}@postgres:5432/agent_platform
+      HARNESS_URL: http://agent-harness:8081
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      # Same Redis instance/db agent-gateway reserves the async pool
+      # against (§6 L2) — QuotaReconciler needs to land its INCRBY on the
+      # exact same key gateway's Lua script wrote.
+      QUOTA_REDIS_URL: redis://redis:6379/1
+      MODEL_ROUTER_URL: http://model-router:4000
+      MODEL_ROUTER_MASTER_KEY: ${LITELLM_MASTER_KEY}
+    volumes:
+      - ../seed/webhook_secrets.yaml:/app/seed/webhook_secrets.yaml:ro
+      - async_worker_data:/app/data
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      model-router: { condition: service_healthy }
+      agent-harness: { condition: service_healthy }
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8085/healthz')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  kong:
+    image: kong:3.6
+    restart: unless-stopped
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /kong/kong.yml
+      KONG_PROXY_LISTEN: "0.0.0.0:8000"
+      KONG_ADMIN_LISTEN: "0.0.0.0:8001"
+    ports: ["8000:8000", "8001:8001"]
+    volumes:
+      - ../config/kong:/kong:ro
+    depends_on:
+      agent-gateway: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+# §21.2/ADR-011 — `hris_internal` is the network policy that makes the
+# audience split real, not just configured (`agent-harness`/mock-business-
+# api join it, `agent-harness-external` deliberately never does).
+networks:
+  default: {}
+  hris_internal: {}
+
+volumes:
+  pgdata:
+  redisdata:
+  langfuse_redis_data:
+  langfuse_clickhouse_data:
+  langfuse_clickhouse_logs:
+  langfuse_minio_data:
+  infinitycache:
+  ollamadata:
+  prometheusdata:
+  grafanadata:
+  async_worker_data:
