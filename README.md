@@ -33,88 +33,76 @@ copy-pasteable commands for every milestone's live behavior, scenario by scenari
 Every service, the message broker, the model backends, and the internal/external network split
 (§21/ADR-011) in one diagram — `agent-harness` sits on `hris_internal` (can reach
 `mock-business-api`); `agent-harness-external` (a separate, off-by-default profile) structurally
-cannot, proven by DNS resolution failing, not just a policy decision. Solid arrows are synchronous
-calls in a request's own path; dotted arrows are side-band (login, webhooks, traces, metrics).
+cannot, proven by DNS resolution failing, not just a policy decision. The numbers (**①**–**⑥**) mark
+the one synchronous request's path, in order — everything else (async, identity, ingestion,
+observability, eval) is a side system, drawn with thin dotted connectors.
 
 ```mermaid
 flowchart LR
-    Client["Client\ncurl / demo script / services/eval CLI"]
+    classDef startEnd fill:#2f855a,stroke:#1c4532,color:#fff,stroke-width:2px;
+    classDef core fill:#2b6cb0,stroke:#1a365d,color:#fff,stroke-width:2px;
+    classDef support fill:#718096,stroke:#2d3748,color:#fff;
+    classDef store fill:#6b46c1,stroke:#44337a,color:#fff;
 
-    subgraph Edge["Edge"]
-        Kong["Kong :8000\nJWT verify (L0) + rate-limiting (L1)\n+ correlation-id"]
-    end
+    Start(["① Client\nsends request"]):::startEnd
+    Kong["② Kong :8000\nJWT verify + rate limit"]:::core
+    Gateway["③ agent-gateway :8080\nidempotency + quota"]:::core
+    End(["⑥ Client\nreceives response"]):::startEnd
 
-    subgraph PublicAPI["Public entrypoint"]
-        Gateway["agent-gateway :8080\nJWT re-verify · Idempotency-Key ·\nquota L2 (Redis token-bucket) · proxy"]
-    end
-
-    Client -->|"Authorization: Bearer <jwt>"| Kong --> Gateway
-
-    subgraph AsyncPath["Async job path"]
-        RMQ["RabbitMQ :5672\nagent.jobs exchange\nstandard / bulk / retry-holding / dlq"]
-        Worker["async-worker :8085\njob executor — calls harness's\nown /internal/v1/runs"]
-    end
-    Gateway -->|"POST /v1/agent/jobs (202)"| RMQ --> Worker
-    Worker -.->|"webhook, HMAC-signed"| Client
-
-    subgraph Identity["Identity — mock-idp :8087"]
-        Idp["/oauth/token (dev login)\n/oauth/token-exchange (RFC 8693)\n/oauth/eval-impersonate (eval only)"]
-    end
-    Client -.->|"login"| Idp
+    Start --> Kong --> Gateway
 
     subgraph HrisNet["hris_internal network — internal audience only"]
-        Harness["agent-harness :8081\nLangGraph orchestrator"]
-        BAPI["mock-business-api :8084\nHR/payroll: query / preview / execute"]
+        Harness["④ agent-harness :8081\nLangGraph orchestrator"]:::core
+        BAPI["mock-business-api :8084\nHR/payroll: query/preview/execute"]:::support
+        Harness --> BAPI
     end
-    Gateway -->|"POST /v1/agent/invoke (sync)"| Harness
-    Worker -->|"POST /internal/v1/runs"| Harness
-    Harness -->|"tool calls"| BAPI
-    Harness -.->|"token exchange\n(mutation preview only)"| Idp
+    Gateway --> Harness
+    Harness --> End
 
-    subgraph RagChain["RAG"]
-        Retrieval["retrieval-service :8082\nhybrid RRF (pgvector+tsvector),\nInfinity rerank, ACL filter"]
-        Ingestion["ingestion-service :8083\nfilesystem → chunk → embed → upsert"]
+    subgraph RagModels["⑤ RAG + model backends"]
+        direction TB
+        Retrieval["retrieval-service :8082\nhybrid search + rerank"]:::support
+        Router["model-router :4000\n→ Gemini / Ollama / Infinity"]:::support
     end
-    Harness -->|"POST /internal/v1/search"| Retrieval
-    Ingestion -->|"POST /internal/v1/cache/invalidate"| Harness
+    Harness --> Retrieval
+    Harness --> Router
 
-    subgraph ExtProfile["agent-harness-external :8091 — profile external-test\nNOT joined to hris_internal (DNS-proven isolation)"]
-        HarnessExt["same image, HARNESS_AUDIENCE=external\nonly tool: search_public_faq"]
+    subgraph ExtNet["agent-harness-external :8091 — profile external-test\nNOT on hris_internal (DNS-proven isolation)"]
+        HarnessExt["same image,\nHARNESS_AUDIENCE=external"]:::support
     end
     HarnessExt -->|"search_public_faq only"| Retrieval
 
-    subgraph Models["Model backends — config/model-router/ only"]
-        Router["model-router :4000 (LiteLLM)\nagent-primary/-cheap/-local · eval-judge ·\nembedding-default"]
-        Gemini["Gemini API (optional)"]
-        Ollama["ollama :11434\nqwen2.5:3b — local fallback"]
-        Infinity["infinity :7997\nbge-m3 embed + rerank"]
+    subgraph AsyncLane["side system — async alternative to ②→③→④"]
+        direction LR
+        Queue["RabbitMQ\nagent.jobs"]:::support
+        Worker["async-worker :8085"]:::support
+        Queue --> Worker
     end
-    Harness --> Router
-    Ingestion -->|"embed"| Router
-    Retrieval -->|"rerank"| Infinity
-    Router --> Gemini
-    Router --> Ollama
-    Router --> Infinity
+    Gateway -. "POST /v1/agent/jobs (202)" .-> Queue
+    Worker -. "POST /internal/v1/runs" .-> Harness
+    Worker -. "webhook, HMAC-signed" .-> Start
 
-    subgraph Data["Data & state"]
-        Postgres[("postgres :5432\nconversation · audit ·\nauthz · jobs · catalog · eval")]
-        Redis[("redis :6379\ndb0 cache · db1 quota · db2 authz")]
+    subgraph State["side system — shared state"]
+        direction TB
+        Postgres[("postgres :5432")]:::store
+        Redis[("redis :6379")]:::store
     end
-    Harness --- Postgres
-    Harness --- Redis
-    Gateway --- Postgres
-    Gateway --- Redis
+    Gateway -.- State
+    Harness -.- State
 
-    subgraph Obs["Observability"]
-        Langfuse["langfuse :3030"]
-        Prom["prometheus :9090 → grafana :3001"]
+    subgraph SideSystems["side systems — identity, ingestion, observability, eval"]
+        direction TB
+        Idp["mock-idp :8087"]:::support
+        Ingestion["ingestion-service :8083"]:::support
+        Obs["langfuse + prometheus/grafana"]:::support
+        Eval["services/eval (CLI)"]:::support
     end
-    Harness -.->|"traces"| Langfuse
-    Harness -.->|"/metrics"| Prom
-
-    Eval["services/eval — CLI (uv run),\nnever its own container"]
-    Eval -->|"impersonate"| Idp
-    Eval -->|"invoke, X-Eval-Mode: true"| Kong
+    Start -.->|"login"| Idp
+    Harness -.->|"token exchange"| Idp
+    Ingestion -.->|"cache invalidate"| Harness
+    Harness -.->|"traces + metrics"| Obs
+    Eval -.->|"impersonate"| Idp
+    Eval -.->|"invoke, X-Eval-Mode: true"| Kong
 ```
 
 Nine more diagrams — one per major flow (gateway request lifecycle, the LangGraph node graph, the

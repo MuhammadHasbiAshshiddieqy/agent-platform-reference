@@ -16,99 +16,89 @@ it's the thing that makes the audience split a *network* fact, not just a policy
 `agent-harness-external` is never joined to `hris_internal`, so it cannot resolve
 `mock-business-api` at the DNS level, regardless of what any policy engine decides.
 
+The numbers (**①**–**⑥**) mark the one synchronous request's path through the system, in order —
+follow those first. Everything else on the diagram (async, identity, ingestion, observability,
+eval) is a **side system**, drawn with thin dotted connectors so it never competes with that main
+path for attention.
+
 ```mermaid
 flowchart LR
-    Client["Client\ncurl / demo script / services/eval CLI"]
+    classDef startEnd fill:#2f855a,stroke:#1c4532,color:#fff,stroke-width:2px;
+    classDef core fill:#2b6cb0,stroke:#1a365d,color:#fff,stroke-width:2px;
+    classDef support fill:#718096,stroke:#2d3748,color:#fff;
+    classDef store fill:#6b46c1,stroke:#44337a,color:#fff;
 
-    subgraph Edge["Edge"]
-        Kong["Kong :8000\nJWT verify (L0) + rate-limiting (L1)\n+ correlation-id"]
-    end
+    Start(["① Client\nsends request"]):::startEnd
+    Kong["② Kong :8000\nJWT verify + rate limit"]:::core
+    Gateway["③ agent-gateway :8080\nidempotency + quota"]:::core
+    End(["⑥ Client\nreceives response"]):::startEnd
 
-    subgraph PublicAPI["Public entrypoint"]
-        Gateway["agent-gateway :8080\nJWT re-verify · Idempotency-Key ·\nquota L2 (Redis token-bucket) · proxy"]
-    end
-
-    Client -->|"Authorization: Bearer <jwt>"| Kong --> Gateway
-
-    subgraph AsyncPath["Async job path"]
-        RMQ["RabbitMQ :5672\nagent.jobs exchange\nstandard / bulk / retry-holding / dlq"]
-        Worker["async-worker :8085\njob executor — calls harness's\nown /internal/v1/runs"]
-    end
-    Gateway -->|"POST /v1/agent/jobs (202)"| RMQ --> Worker
-    Worker -.->|"webhook, HMAC-signed"| Client
-
-    subgraph Identity["Identity — mock-idp :8087"]
-        Idp["/oauth/token (dev login)\n/oauth/token-exchange (RFC 8693)\n/oauth/eval-impersonate (eval only)"]
-    end
-    Client -.->|"login"| Idp
+    Start --> Kong --> Gateway
 
     subgraph HrisNet["hris_internal network — internal audience only"]
-        Harness["agent-harness :8081\nLangGraph orchestrator\n(see §3.2 for the node graph)"]
-        BAPI["mock-business-api :8084\nHR/payroll: query / preview / execute"]
+        Harness["④ agent-harness :8081\nLangGraph orchestrator\n(see §3 for the node graph)"]:::core
+        BAPI["mock-business-api :8084\nHR/payroll: query/preview/execute"]:::support
+        Harness --> BAPI
     end
-    Gateway -->|"POST /v1/agent/invoke (sync)"| Harness
-    Worker -->|"POST /internal/v1/runs"| Harness
-    Harness -->|"tool calls"| BAPI
-    Harness -.->|"token exchange\n(mutation preview only)"| Idp
+    Gateway --> Harness
+    Harness --> End
 
-    subgraph RagChain["RAG"]
-        Retrieval["retrieval-service :8082\nhybrid RRF (pgvector+tsvector),\nInfinity rerank, ACL filter"]
-        Ingestion["ingestion-service :8083\nfilesystem → chunk → embed → upsert"]
+    subgraph RagModels["⑤ RAG + model backends, called from the graph"]
+        direction TB
+        Retrieval["retrieval-service :8082\nhybrid search + Infinity rerank"]:::support
+        Router["model-router :4000\n→ Gemini / Ollama / Infinity"]:::support
     end
-    Harness -->|"POST /internal/v1/search"| Retrieval
-    Ingestion -->|"POST /internal/v1/cache/invalidate"| Harness
+    Harness --> Retrieval
+    Harness --> Router
 
-    subgraph ExtProfile["agent-harness-external :8091 — profile external-test\nNOT joined to hris_internal (DNS-proven isolation)"]
-        HarnessExt["same image, HARNESS_AUDIENCE=external\nonly tool: search_public_faq"]
+    subgraph ExtNet["agent-harness-external :8091 — profile external-test\nNOT on hris_internal (DNS-proven isolation)"]
+        HarnessExt["same image,\nHARNESS_AUDIENCE=external"]:::support
     end
     HarnessExt -->|"search_public_faq only"| Retrieval
 
-    subgraph Models["Model backends — config/model-router/ only, boundary #3"]
-        Router["model-router :4000 (LiteLLM)\nagent-primary/-cheap/-local · eval-judge ·\nembedding-default"]
-        Gemini["Gemini API\n(agent-primary/-cheap, optional)"]
-        Ollama["ollama :11434\nqwen2.5:3b — local fallback\n+ eval-judge (ADR-012)"]
-        Infinity["infinity :7997\nbge-m3 embed + bge-reranker-base rerank"]
+    subgraph AsyncLane["side system — async alternative to ②→③→④"]
+        direction LR
+        Queue["RabbitMQ\nagent.jobs"]:::support
+        Worker["async-worker :8085"]:::support
+        Queue --> Worker
     end
-    Harness --> Router
-    Ingestion -->|"embed"| Router
-    Retrieval -->|"rerank"| Infinity
-    Router --> Gemini
-    Router --> Ollama
-    Router --> Infinity
+    Gateway -. "POST /v1/agent/jobs (202)" .-> Queue
+    Worker -. "POST /internal/v1/runs" .-> Harness
+    Worker -. "webhook, HMAC-signed" .-> Start
 
-    subgraph Data["Data & state"]
-        Postgres[("postgres :5432\nschemas: conversation · audit ·\nauthz · jobs · catalog · eval")]
-        Redis[("redis :6379\ndb0 semantic cache · db1 gateway quota ·\ndb2 harness killswitch/authz cache")]
+    subgraph State["side system — shared state"]
+        direction TB
+        Postgres[("postgres :5432")]:::store
+        Redis[("redis :6379")]:::store
     end
-    Harness --- Postgres
-    Harness --- Redis
-    Gateway --- Postgres
-    Gateway --- Redis
-    Worker --- Postgres
-    Ingestion --- Postgres
-    Retrieval --- Postgres
+    Gateway -.- State
+    Harness -.- State
 
-    subgraph Obs["Observability"]
-        Langfuse["langfuse :3030\n(+ clickhouse, minio, langfuse-redis)"]
-        Prom["prometheus :9090 → grafana :3001"]
+    subgraph SideSystems["side systems — identity, ingestion, observability, eval"]
+        direction TB
+        Idp["mock-idp :8087\nlogin / token-exchange"]:::support
+        Ingestion["ingestion-service :8083"]:::support
+        Obs["langfuse + prometheus/grafana"]:::support
+        Eval["services/eval (CLI,\nnever its own container)"]:::support
     end
-    Harness -.->|"trace spans"| Langfuse
-    Harness -.->|"/metrics"| Prom
-    Gateway -.->|"/metrics"| Prom
-
-    Eval["services/eval — CLI (uv run),\nnever its own container"]
-    Eval -->|"impersonate"| Idp
-    Eval -->|"invoke, X-Eval-Mode: true"| Kong
+    Start -.->|"login"| Idp
+    Harness -.->|"token exchange\n(mutation preview only)"| Idp
+    Ingestion -.->|"cache invalidate"| Harness
+    Harness -.->|"traces + /metrics"| Obs
+    Eval -.->|"impersonate"| Idp
+    Eval -.->|"invoke, X-Eval-Mode: true"| Kong
 ```
 
 Notes on reading this diagram:
 
-- **Solid arrows** are synchronous HTTP calls in the request's own path. **Dotted arrows** are
-  side-band (login, webhooks, traces, metrics, token exchange) — the caller doesn't block its main
-  response on them.
+- **Green** = the request's entry/exit. **Blue** = the two services on the request's own critical
+  path besides Kong. **Grey** = everything else the graph calls out to. **Purple** = durable state.
+- **Solid arrows** trace the one synchronous request, in numbered order. **Dotted arrows** are
+  side-band (login, webhooks, traces, metrics, token exchange, async) — the caller doesn't block
+  its main response on them.
 - `agent-harness` sits in `hris_internal` *and* `default` — it's the only orchestrator allowed to
-  reach `mock-business-api`. `agent-harness-external` sits only in `default`; the box around it in
-  the diagram is the actual Docker network boundary, not a drawing convention.
+  reach `mock-business-api`. `agent-harness-external` sits only in `default`; the box around each
+  is the actual Docker network boundary, not a drawing convention.
 - `services/eval` and the demo `curl` client are both just HTTP clients of the same public surface
   (Kong) — eval-service has no special network access, only a special mock-idp endpoint
   (`/oauth/eval-impersonate`) that itself re-checks the tenant server-side.
@@ -161,20 +151,28 @@ mid-loop) with a single bounded `respond ↔ act` loop.
 
 ```mermaid
 flowchart TD
-    START(("START")) --> Authorize["authorize\nfive-set intersection (§3.2 below);\nlogs audit.authz_decisions"]
-    Authorize --> InputGR["input_guardrails\nsize → PII redact → injection → off-topic"]
-    InputGR -- refuse --> END1(("END\nrefusal"))
-    InputGR -- continue --> CacheLookup["cache_lookup\nnormalize → embed → RediSearch KNN\nnamespace: semcache:{tenant}:{agent}:{acl_hash}:{prompt_version}"]
-    CacheLookup -- hit --> END2(("END\ncache_hit=true, 0 tokens"))
-    CacheLookup -- miss --> Retrieve["retrieve\nhybrid RRF search, ACL-filtered\n(degrades, doesn't fail closed)"]
-    Retrieve --> RagGR["rag_guardrails\nper-chunk injection scan"]
-    RagGR --> Respond["respond\noffers tenant/permission-filtered\ntool schema; accumulates tools_offered"]
-    Respond -- tool_calls --> Act["act\nexecutor: scope check → query/preview/execute\n(MAX_TOOL_ITERATIONS = 2)"]
+    classDef startEnd fill:#2f855a,stroke:#1c4532,color:#fff,stroke-width:2px;
+    classDef node fill:#2b6cb0,stroke:#1a365d,color:#fff;
+    classDef loopNode fill:#b7791f,stroke:#7b341e,color:#fff;
+
+    START(("START")):::startEnd --> Authorize["authorize\nfive-set intersection (§3.2 below);\nlogs audit.authz_decisions"]:::node
+    Authorize --> InputGR["input_guardrails\nsize → PII redact → injection → off-topic"]:::node
+    InputGR -- refuse --> END1(("END\nrefusal")):::startEnd
+    InputGR -- continue --> CacheLookup["cache_lookup\nnormalize → embed → RediSearch KNN\nnamespace: semcache:{tenant}:{agent}:{acl_hash}:{prompt_version}"]:::node
+    CacheLookup -- hit --> END2(("END\ncache_hit=true, 0 tokens")):::startEnd
+    CacheLookup -- miss --> Retrieve["retrieve\nhybrid RRF search, ACL-filtered\n(degrades, doesn't fail closed)"]:::node
+    Retrieve --> RagGR["rag_guardrails\nper-chunk injection scan"]:::node
+    RagGR --> Respond["respond\noffers tenant/permission-filtered\ntool schema; accumulates tools_offered"]:::loopNode
+    Respond -- tool_calls --> Act["act\nexecutor: scope check → query/preview/execute\n(MAX_TOOL_ITERATIONS = 2)"]:::loopNode
     Act --> Respond
-    Respond -- final answer --> OutputGR["output_guardrails\nformat validity (1 retry) → groundedness →\nPII leak redact → policy block"]
-    OutputGR --> CacheWrite["cache_write\nwrites back only if all §10\neligibility conditions hold"]
-    CacheWrite --> END3(("END"))
+    Respond -- final answer --> OutputGR["output_guardrails\nformat validity (1 retry) → groundedness →\nPII leak redact → policy block"]:::node
+    OutputGR --> CacheWrite["cache_write\nwrites back only if all §10\neligibility conditions hold"]:::node
+    CacheWrite --> END3(("END")):::startEnd
 ```
+
+Green circles are the graph's only entry/exit points — one `START`, three possible `END`s (early
+refusal, a cache hit, or the normal path). The amber `respond ↔ act` pair is the only cycle in the
+whole graph, bounded at two iterations.
 
 ## 3.2 Authorization: the five-set intersection (§22.1)
 
@@ -183,18 +181,19 @@ never re-derived mid-turn.
 
 ```mermaid
 flowchart LR
-    A["agent_profile.allowed_tools\nconfig/agents/*.yaml — design-time ceiling"]
-    B["HARNESS_AUDIENCE-filtered\ntool manifest\nconfig/tools/*.yaml"]
-    C["caller's permissions\n(JWT claim)"]
-    D["allow_mutations\n(request option)"]
-    E["¬killswitch\n(Redis, 10s cache)"]
-    A --> X(("∩"))
-    B --> X
-    C --> X
-    D --> X
-    E --> X
-    X --> Result["candidate tools offered to the model\n(every candidate logged to\naudit.authz_decisions, allow or deny)"]
+    classDef input fill:#2f855a,stroke:#1c4532,color:#fff;
+    classDef gate fill:#b7791f,stroke:#7b341e,color:#fff,stroke-width:2px;
+    classDef result fill:#2b6cb0,stroke:#1a365d,color:#fff,stroke-width:2px;
+
+    A["agent_profile.allowed_tools\nconfig/agents/*.yaml — design-time ceiling"]:::input --> X
+    B["HARNESS_AUDIENCE-filtered\ntool manifest\nconfig/tools/*.yaml"]:::input --> X
+    C["caller's permissions\n(JWT claim)"]:::input --> X
+    D["allow_mutations\n(request option)"]:::input --> X
+    E["¬killswitch\n(Redis, 10s cache)"]:::input --> X(("∩")):::gate
+    X --> Result["candidate tools offered to the model\n(every candidate logged to\naudit.authz_decisions, allow or deny)"]:::result
 ```
+
+The five green inputs are where the flow starts; the blue box on the right is where it ends.
 
 A tool surviving this intersection is only offered to the model — `tools/executor.py` re-checks
 membership again at *execution* time (§22.4's "pengecekan kedua"), and a `data_scope: self`
@@ -272,32 +271,38 @@ sequenceDiagram
 
 ```mermaid
 flowchart LR
-    FS["seed/documents/*.md\nfrontmatter: tenant_id, acl_group_ids,\ndoc_code, title, lang"]
-    Conn["connectors/filesystem.py\nmanual frontmatter parser"]
-    Chunk["chunking.py\nheader-aware, tracks H1>H2\nsection_path breadcrumbs"]
-    Embed["model-router\nembedding-default → Infinity"]
-    Upsert["repository.py\ncontent-hash incremental sync +\nsoft-delete tombstoning"]
-    PG[("catalog.documents /\ncatalog.chunks")]
-    Inv["POST harness\n/internal/v1/cache/invalidate\n(best-effort, logs-and-continues)"]
+    classDef startEnd fill:#2f855a,stroke:#1c4532,color:#fff,stroke-width:2px;
+    classDef step fill:#2b6cb0,stroke:#1a365d,color:#fff;
+    classDef store fill:#6b46c1,stroke:#44337a,color:#fff;
+    classDef sideEffect fill:#718096,stroke:#2d3748,color:#fff;
 
-    FS --> Conn --> Chunk --> Embed --> Upsert --> PG
-    Upsert -->|"changed/tombstoned document_ids"| Inv
-
-    Note1["each document runs in its OWN\ntenant_session (§5.11) — one bad\ndoc's error can't abort the whole run"]
+    FS(["start:\nseed/documents/*.md"]):::startEnd --> Conn["connectors/filesystem.py\nmanual frontmatter parser"]:::step
+    Conn --> Chunk["chunking.py\nheader-aware, tracks H1>H2\nsection_path breadcrumbs"]:::step
+    Chunk --> Embed["model-router\nembedding-default → Infinity"]:::step
+    Embed --> Upsert["repository.py\ncontent-hash incremental sync +\nsoft-delete tombstoning"]:::step
+    Upsert --> PG[("end:\ncatalog.documents / catalog.chunks")]:::store
+    Upsert -.->|"changed/tombstoned document_ids"| Inv["side effect:\nPOST harness /internal/v1/cache/invalidate\n(best-effort, logs-and-continues)"]:::sideEffect
 ```
+
+Each document runs in its own `tenant_session` (§5.11) through this whole chain — one bad
+document's error can't abort another document's insert in the same run.
 
 ## 7. Retrieval: hybrid search (§28.9)
 
 ```mermaid
 flowchart LR
-    Q["query text"] --> Dense["dense candidates\npgvector <=> cosine\n(hnsw.iterative_scan=relaxed_order)"]
-    Q --> Sparse["sparse candidates\ntsvector / ts_rank_cd"]
-    Dense --> RRF["Reciprocal Rank Fusion\nconstant=60"]
+    classDef startEnd fill:#2f855a,stroke:#1c4532,color:#fff,stroke-width:2px;
+    classDef step fill:#2b6cb0,stroke:#1a365d,color:#fff;
+    classDef warn fill:#c53030,stroke:#742a2a,color:#fff;
+
+    Q(["start: query text"]):::startEnd --> Dense["dense candidates\npgvector <=> cosine\n(hnsw.iterative_scan=relaxed_order)"]:::step
+    Q --> Sparse["sparse candidates\ntsvector / ts_rank_cd"]:::step
+    Dense --> RRF["Reciprocal Rank Fusion\nconstant=60"]:::step
     Sparse --> RRF
-    RRF --> Rerank["Infinity rerank\n(direct call, no LiteLLM abstraction)"]
-    Rerank --> ACL["acl_group_ids && caller's acl\n(tenant_id enforced separately by RLS,\nnot in this WHERE clause)"]
-    ACL --> Result["ranked chunks + citations"]
-    Rerank -. "rerank failure" .-> Degraded["degraded=[\"rerank\"]\n(embedding failure has no fallback\n— fails closed instead)"]
+    RRF --> Rerank["Infinity rerank\n(direct call, no LiteLLM abstraction)"]:::step
+    Rerank --> ACL["acl_group_ids && caller's acl\n(tenant_id enforced separately by RLS,\nnot in this WHERE clause)"]:::step
+    ACL --> Result(["end: ranked chunks + citations"]):::startEnd
+    Rerank -. "rerank failure" .-> Degraded["degraded=[\"rerank\"]\n(embedding failure has no fallback\n— fails closed instead)"]:::warn
 ```
 
 ## 8. Semantic cache (§10)
@@ -307,15 +312,20 @@ namespace key — not a separate check layered on afterward.
 
 ```mermaid
 flowchart TD
-    Query["normalized query + tenant_id + agent_id + acl_group_ids"]
-    Query --> Hash["acl_hash = sha256(sorted(acl_group_ids))[:16]"]
-    Hash --> NS["namespace: semcache:{tenant_id}:{agent_id}:{acl_hash}:{prompt_version}"]
-    NS --> KNN["RediSearch KNN lookup (db 0 only —\nFT.SEARCH doesn't work on other logical DBs)"]
-    KNN -- hit --> Skip["skip retrieve/respond/act/output_guardrails\ncache_hit=true, 0 tokens, 0 cost"]
-    KNN -- miss --> Run["run the full graph"]
-    Run --> Elig{"eligible to write back?\n(cache/eligibility.py, ALL must hold)"}
-    Elig -->|"agent+tool cacheable:true\nnot refused, retrieval not degraded\nno guardrail flag / PII event"| Write["write to Redis"]
-    Elig -->|"any condition fails —\ne.g. one personal-data tool call"| Skip2["never cached"]
+    classDef startNode fill:#2f855a,stroke:#1c4532,color:#fff,stroke-width:2px;
+    classDef step fill:#2b6cb0,stroke:#1a365d,color:#fff;
+    classDef hitEnd fill:#2f855a,stroke:#1c4532,color:#fff,stroke-width:2px;
+    classDef missEnd fill:#718096,stroke:#2d3748,color:#fff;
+    classDef decision fill:#b7791f,stroke:#7b341e,color:#fff;
+
+    Query(["start: normalized query +\ntenant_id + agent_id + acl_group_ids"]):::startNode --> Hash["acl_hash = sha256(sorted(acl_group_ids))[:16]"]:::step
+    Hash --> NS["namespace:\nsemcache:{tenant_id}:{agent_id}:{acl_hash}:{prompt_version}"]:::step
+    NS --> KNN["RediSearch KNN lookup (db 0 only —\nFT.SEARCH doesn't work on other logical DBs)"]:::step
+    KNN -- hit --> Skip(["end: cache_hit=true\n0 tokens, 0 cost, graph short-circuits"]):::hitEnd
+    KNN -- miss --> Run["run the full graph"]:::step
+    Run --> Elig{"eligible to write back?\n(cache/eligibility.py, ALL must hold)"}:::decision
+    Elig -->|"agent+tool cacheable:true\nnot refused, retrieval not degraded\nno guardrail flag / PII event"| Write(["end: written to Redis"]):::hitEnd
+    Elig -->|"any condition fails —\ne.g. one personal-data tool call"| Skip2(["end: never cached"]):::missEnd
 ```
 
 ## 9. Evaluation pipeline (§13)
