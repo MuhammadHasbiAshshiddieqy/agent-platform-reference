@@ -43,3 +43,37 @@ def test_total_size_is_respected() -> None:
     items = _items([(f"it_{i}", ["rag"]) for i in range(50)])
     sample = stratified_sample(items, per_tag_quota=8, total_size=10)
     assert len(sample) == 10
+
+
+def test_a_tag_still_reaches_its_quota_when_a_shared_item_is_claimed_by_an_earlier_tag() -> None:
+    # it_a is claimed by "mutation" (processed first, alphabetically) before "rbac"
+    # gets to it. rbac's own bucket has two other real candidates (it_c, it_d) — a
+    # correct implementation walks past the already-claimed it_a to find both of
+    # them rather than silently costing rbac one of its two guaranteed slots.
+    # total_size=3 is deliberately tight so the remainder phase can't mask the bug
+    # by backfilling it_d anyway.
+    items = _items(
+        [
+            ("it_a", ["mutation", "rbac"]),
+            ("it_b", ["mutation"]),
+            ("it_c", ["rbac"]),
+            ("it_d", ["rbac"]),
+        ]
+    )
+    sample = stratified_sample(items, per_tag_quota=2, total_size=3)
+    rbac_ids = {item["id"] for item in sample if "rbac" in item["tags"]}  # type: ignore[operator]
+    assert {"it_c", "it_d"}.issubset(rbac_ids)
+
+
+def test_total_size_never_truncates_a_tags_already_guaranteed_quota() -> None:
+    # per_tag_quota=3 * 2 tags = 6 potential quota items, but total_size caps at 4.
+    # Every tag must still keep its full quota — total_size is a soft budget for the
+    # remainder top-up only, never grounds to break the stratification guarantee.
+    items = _items([(f"it_mut_{i}", ["mutation"]) for i in range(3)]) + _items(
+        [(f"it_rbac_{i}", ["rbac"]) for i in range(3)]
+    )
+    sample = stratified_sample(items, per_tag_quota=3, total_size=4)
+    mutation_count = sum(1 for item in sample if "mutation" in item["tags"])  # type: ignore[operator]
+    rbac_count = sum(1 for item in sample if "rbac" in item["tags"])  # type: ignore[operator]
+    assert mutation_count == 3
+    assert rbac_count == 3
