@@ -254,7 +254,7 @@ sequenceDiagram
     alt success
         H-->>W: AgentInvokeResponse
         W->>W: status=succeeded
-        W-->>C: webhook, X-Duta-Signature: sha256=<hmac>
+        W-->>C: webhook, X-Duta-Signature header (sha256 HMAC)
     else failure, attempts < MAX_ATTEMPTS
         W->>Q: republish to agent.jobs.retry.holding\n(per-message TTL: 10s → 60s → 300s)
         Q-->>Q: TTL expires → dead-lettered back to\nagent.jobs exchange, original routing key
@@ -295,14 +295,14 @@ flowchart LR
     classDef step fill:#2b6cb0,stroke:#1a365d,color:#fff;
     classDef warn fill:#c53030,stroke:#742a2a,color:#fff;
 
-    Q(["start: query text"]):::startEnd --> Dense["dense candidates\npgvector <=> cosine\n(hnsw.iterative_scan=relaxed_order)"]:::step
+    Q(["start: query text"]):::startEnd --> Dense["dense candidates\npgvector cosine distance\n(hnsw.iterative_scan=relaxed_order)"]:::step
     Q --> Sparse["sparse candidates\ntsvector / ts_rank_cd"]:::step
     Dense --> RRF["Reciprocal Rank Fusion\nconstant=60"]:::step
     Sparse --> RRF
     RRF --> Rerank["Infinity rerank\n(direct call, no LiteLLM abstraction)"]:::step
     Rerank --> ACL["acl_group_ids && caller's acl\n(tenant_id enforced separately by RLS,\nnot in this WHERE clause)"]:::step
     ACL --> Result(["end: ranked chunks + citations"]):::startEnd
-    Rerank -. "rerank failure" .-> Degraded["degraded=[\"rerank\"]\n(embedding failure has no fallback\n— fails closed instead)"]:::warn
+    Rerank -. "rerank failure" .-> Degraded["degraded=['rerank']\n(embedding failure has no fallback\n— fails closed instead)"]:::warn
 ```
 
 ## 8. Semantic cache (§10)
