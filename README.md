@@ -3,11 +3,16 @@
 Production-grade AI agent platform: per-role RBAC, guardrails, hybrid RAG on pgvector, two-phase mutation contract with human approval, and eval gates in CI. 18 services, one `make demo`, zero cost.
 
 Full spec: [docs/SPEC.md](docs/SPEC.md). Working context for contributors (and Claude Code): [CLAUDE.md](CLAUDE.md).
+Diagrams (system topology + one flow diagram per major interaction): [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+How to actually run things on a resource-constrained laptop — short demo, RAG eval, mutation
+approval, async jobs, killswitch, troubleshooting: [docs/RUNBOOK.md](docs/RUNBOOK.md).
 
 ## Status
 
 Under active implementation, milestone by milestone (§15 of the spec) — this is not yet the finished
-demo the spec describes. `make demo` and a walkthrough GIF land once the milestone list below reaches M7.
+demo the spec describes. `make demo` itself is still an intentionally-unimplemented guard (§27.2
+reserves it for M9's polish pass); [docs/RUNBOOK.md](docs/RUNBOOK.md) is the current substitute —
+copy-pasteable commands for every milestone's live behavior, scenario by scenario.
 
 | Milestone | State | What exists |
 |---|---|---|
@@ -23,7 +28,106 @@ demo the spec describes. `make demo` and a walkthrough GIF land once the milesto
 | M8 — Evaluation | ✅ done | `services/eval` — a CLI tool (`uv run python -m eval_service.{run,gate,report}`), never its own container. Six deterministic metrics (§13.3, no LLM — tool selection, mutation safety, citation validity, refusal appropriateness, capability leak, PII leakage) gate on every run; four Ragas-judged metrics (faithfulness, answer relevancy, context precision/recall) gate statistically (median-of-k, fixed-seed bootstrap CI vs. a stored baseline, absolute-floor tripwire). `_eval` debug bundle attached to responses only for `EVAL_TENANT_IDS` tenants via a dedicated `mock-idp` impersonation endpoint. A judge failure degrades gracefully per-item rather than crashing the run. Live-verified: a full 16-item smoke run correctly blocked on real findings, with the two zero-tolerance security metrics (mutation safety, PII leakage) passing cleanly; gating the same run twice produced a byte-identical verdict |
 | M9 — Production hardening | not started | |
 
-Quickstart (M0+M1+M2+M3+M4+M5+M5b+M6+M7+M8):
+## Architecture
+
+Every service, the message broker, the model backends, and the internal/external network split
+(§21/ADR-011) in one diagram — `agent-harness` sits on `hris_internal` (can reach
+`mock-business-api`); `agent-harness-external` (a separate, off-by-default profile) structurally
+cannot, proven by DNS resolution failing, not just a policy decision. Solid arrows are synchronous
+calls in a request's own path; dotted arrows are side-band (login, webhooks, traces, metrics).
+
+```mermaid
+flowchart LR
+    Client["Client\ncurl / demo script / services/eval CLI"]
+
+    subgraph Edge["Edge"]
+        Kong["Kong :8000\nJWT verify (L0) + rate-limiting (L1)\n+ correlation-id"]
+    end
+
+    subgraph PublicAPI["Public entrypoint"]
+        Gateway["agent-gateway :8080\nJWT re-verify · Idempotency-Key ·\nquota L2 (Redis token-bucket) · proxy"]
+    end
+
+    Client -->|"Authorization: Bearer <jwt>"| Kong --> Gateway
+
+    subgraph AsyncPath["Async job path"]
+        RMQ["RabbitMQ :5672\nagent.jobs exchange\nstandard / bulk / retry-holding / dlq"]
+        Worker["async-worker :8085\njob executor — calls harness's\nown /internal/v1/runs"]
+    end
+    Gateway -->|"POST /v1/agent/jobs (202)"| RMQ --> Worker
+    Worker -.->|"webhook, HMAC-signed"| Client
+
+    subgraph Identity["Identity — mock-idp :8087"]
+        Idp["/oauth/token (dev login)\n/oauth/token-exchange (RFC 8693)\n/oauth/eval-impersonate (eval only)"]
+    end
+    Client -.->|"login"| Idp
+
+    subgraph HrisNet["hris_internal network — internal audience only"]
+        Harness["agent-harness :8081\nLangGraph orchestrator"]
+        BAPI["mock-business-api :8084\nHR/payroll: query / preview / execute"]
+    end
+    Gateway -->|"POST /v1/agent/invoke (sync)"| Harness
+    Worker -->|"POST /internal/v1/runs"| Harness
+    Harness -->|"tool calls"| BAPI
+    Harness -.->|"token exchange\n(mutation preview only)"| Idp
+
+    subgraph RagChain["RAG"]
+        Retrieval["retrieval-service :8082\nhybrid RRF (pgvector+tsvector),\nInfinity rerank, ACL filter"]
+        Ingestion["ingestion-service :8083\nfilesystem → chunk → embed → upsert"]
+    end
+    Harness -->|"POST /internal/v1/search"| Retrieval
+    Ingestion -->|"POST /internal/v1/cache/invalidate"| Harness
+
+    subgraph ExtProfile["agent-harness-external :8091 — profile external-test\nNOT joined to hris_internal (DNS-proven isolation)"]
+        HarnessExt["same image, HARNESS_AUDIENCE=external\nonly tool: search_public_faq"]
+    end
+    HarnessExt -->|"search_public_faq only"| Retrieval
+
+    subgraph Models["Model backends — config/model-router/ only"]
+        Router["model-router :4000 (LiteLLM)\nagent-primary/-cheap/-local · eval-judge ·\nembedding-default"]
+        Gemini["Gemini API (optional)"]
+        Ollama["ollama :11434\nqwen2.5:3b — local fallback"]
+        Infinity["infinity :7997\nbge-m3 embed + rerank"]
+    end
+    Harness --> Router
+    Ingestion -->|"embed"| Router
+    Retrieval -->|"rerank"| Infinity
+    Router --> Gemini
+    Router --> Ollama
+    Router --> Infinity
+
+    subgraph Data["Data & state"]
+        Postgres[("postgres :5432\nconversation · audit ·\nauthz · jobs · catalog · eval")]
+        Redis[("redis :6379\ndb0 cache · db1 quota · db2 authz")]
+    end
+    Harness --- Postgres
+    Harness --- Redis
+    Gateway --- Postgres
+    Gateway --- Redis
+
+    subgraph Obs["Observability"]
+        Langfuse["langfuse :3030"]
+        Prom["prometheus :9090 → grafana :3001"]
+    end
+    Harness -.->|"traces"| Langfuse
+    Harness -.->|"/metrics"| Prom
+
+    Eval["services/eval — CLI (uv run),\nnever its own container"]
+    Eval -->|"impersonate"| Idp
+    Eval -->|"invoke, X-Eval-Mode: true"| Kong
+```
+
+Nine more diagrams — one per major flow (gateway request lifecycle, the LangGraph node graph, the
+RBAC five-set intersection, the two-phase mutation/approval contract, async job retry/DLQ,
+ingestion, hybrid retrieval, semantic cache, and the evaluation pipeline) — live in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Quickstart
+
+Full scenario-by-scenario walkthroughs (short demo, RAG chat, guardrails, mutation approval, RBAC,
+async jobs, semantic cache, external-audience isolation, evaluation) are in
+[docs/RUNBOOK.md](docs/RUNBOOK.md) — including this machine's specific resource-ceiling mitigation,
+which the commands below already build in.
 
 ```bash
 git clone <repo>
@@ -32,5 +136,12 @@ cp .env.example .env        # fill in secrets — see CLAUDE.md
 make up                     # docker compose up -d, waits for healthy
 make migrate                # alembic upgrade head
 curl -X POST http://localhost:8083/internal/v1/ingest/tnt_demo   # load the seed corpus (§26.1)
+curl -X POST http://localhost:8083/internal/v1/ingest/tnt_eval   # load the eval corpus (§13.7)
+
+# This machine's 7.75GB Docker VM is right at its ceiling with everything up (see
+# docs/RUNBOOK.md §1) — stop the observability stack before anything RAG-/LLM-heavy:
+docker compose -f deploy/docker-compose.yml --env-file .env stop \
+  langfuse langfuse-worker clickhouse grafana prometheus minio
+
 make test                   # everything, including live integration tests against the stack
 ```
