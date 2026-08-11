@@ -234,7 +234,8 @@ curl -s -X POST http://localhost:8091/internal/v1/runs -H 'Content-Type: applica
   \"run_id\": \"run_$(uuidgen)\", \"trace_id\": \"trc_$(uuidgen)\",
   \"tenant_id\": \"tnt_demo\", \"user_id\": \"usr_public\", \"acl_group_ids\": [\"grp_public\"],
   \"agent_id\": \"public-faq-bot\", \"input\": {\"type\": \"text\", \"content\": \"Apa itu perusahaan ini?\"},
-  \"context\": {}, \"options\": {}, \"execution_mode\": \"sync\"
+  \"context\": {}, \"options\": {}, \"execution_mode\": \"sync\",
+  \"budget\": {\"pool\": \"sync\", \"reserved_tokens\": 4000}
 }" | python3 -m json.tool
 ```
 

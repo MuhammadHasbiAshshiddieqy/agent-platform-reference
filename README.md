@@ -6,6 +6,9 @@ Full spec: [docs/SPEC.md](docs/SPEC.md). Working context for contributors (and C
 Diagrams (system topology + one flow diagram per major interaction): [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 How to actually run things on a resource-constrained laptop — short demo, RAG eval, mutation
 approval, async jobs, killswitch, troubleshooting: [docs/RUNBOOK.md](docs/RUNBOOK.md).
+Want to test just the agent without the full ~20-container stack (skip Langfuse, RabbitMQ,
+ingestion, everything not needed for that one demo)? [docs/DEMO.md](docs/DEMO.md) — two minimal,
+live-verified profiles (6 or 10 containers).
 Advisory notes on what a real production deployment might optimize (not scheduled, not part of any
 milestone's DoD): [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md).
 
