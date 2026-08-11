@@ -370,3 +370,13 @@ the gate on any nonzero count, with no override possible — everything else is 
 be overridden with two reviewers (§13.8's verdict table). Re-running `gate.py` against an
 already-persisted `run_id` never re-invokes the LLM and produces a byte-identical verdict — the
 literal §15 DoD, proven by `services/eval/tests/unit/test_gate.py` and live.
+
+**A separate, parallel flow — `make eval-nightly-sample`** (§13.9) reads real production traces
+back out of Langfuse's public API (`clients/langfuse.py`, never ClickHouse directly — same
+"don't reach into another system's private storage" reasoning as boundary #2's own schema
+isolation) instead of the golden set, scores each with a new hand-rolled `citation_support` judge
+plus the two Ragas metrics that don't need a ground-truth `reference` (`faithfulness`,
+`answer_relevancy` — `context_precision`/`context_recall` need one no production trace has), and
+writes the lowest-scoring N to a markdown report for a human to read. It never writes to
+`eval.items` or `seed/eval/golden_set.yaml` — §13.9's own text is explicit that curation must stay
+manual, or the golden set's quality degrades silently over time.

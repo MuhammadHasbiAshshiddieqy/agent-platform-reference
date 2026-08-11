@@ -218,6 +218,57 @@ case. `.github/workflows/eval.yml` implements §13.8's smoke/full split plus a s
 `promote-baseline` job gated on `push` to `main` (never a PR gate itself), matching "baseline
 diperbarui otomatis setelah merge ke main."
 
+**Follow-up session, still M8**: §13.9's nightly-tier "production trace sampling" — the one piece
+of the milestone explicitly left unbuilt above (`--tier nightly` was, and still is, literally
+`--tier full` under a different name) — is now real, as a genuinely separate CLI
+(`python -m eval_service.nightly_sample --agent-id hr-assistant`, `make eval-nightly-sample`), not
+folded into `run.py`'s tier machinery since it scores a fundamentally different shape of input (a
+live trace, not a golden-set item with expected/ground-truth fields). It reads traces back out of
+Langfuse's **public API/SDK** (`clients/langfuse.py`, `Langfuse().fetch_traces`/`fetch_trace`) —
+deliberately never ClickHouse directly, on the same "don't reach into another system's private
+storage" reasoning boundary #2 already states for this repo's own schemas: ClickHouse is Langfuse's
+internal implementation detail, not a contract it promises to keep stable, where the REST API is.
+Two metrics run per trace, both chosen specifically because they don't need a `reference` (no
+production trace has ground truth): `faithfulness`/`answer_relevancy`, reusing `JudgeRunner.
+score_item` as-is (`reference=None` — `context_precision`/`context_recall` still get computed by
+that call but are discarded, since they're meaningless without a reference), and a new
+`citation_support` (`metrics/citation_support.py`) — not a Ragas metric at all, a direct hand-rolled
+judge call (one prompt per cited chunk, "does this passage support this claim", averaged), sharing
+`eval.judge_cache` but never importing `JudgeRunner`. Lowest-`N` traces by combined score get
+written to `reports/production_review_{agent_id}_{timestamp}.md` for a human to read — **never**
+`eval.items`/`golden_set.yaml`, matching §13.9's own explicit "jangan dimasukkan otomatis" (an
+auto-curated dataset degrades gate quality silently, the same reasoning `datasets/sampler.py`'s own
+determinism requirement already protects from a different angle).
+
+Needed one small, genuinely new instrumentation piece in `agent-harness` to work at all:
+`observability/tracing.py`'s `record_run` now tags every trace `agent:{agent_id}`/
+`tenant:{tenant_id}` (Langfuse's list API filters server-side on tags, not arbitrary metadata keys)
+and carries `cited_chunks` (chunk_id/source_uri/**content**) in trace metadata — `contracts.agent.
+Citation` only ever carried a chunk_id, never the text itself, and a faithfulness/citation_support
+judge needs the real passage, not just its id. This runs for **every** request now, not just
+eval-tagged ones — a production trace has no `_eval` bundle to fall back on. **A real bug found
+live, same class as every other M8 finding**: the very first end-to-end attempt at reading a trace
+back out showed `trace.input`/`trace.output` as `None` despite the child `llm_call_1` generation
+span clearly having both — `record_run`'s `langfuse.trace(...)` call was never passing `input=`/
+`output=` to the trace itself, only to its child span/generation; Langfuse's `fetch_trace`/
+`fetch_traces` read the **trace's own** `.input`/`.output` fields directly and never descend into
+observations. One-line fix (pass both to `.trace()` too), caught only because this session actually
+fetched a trace back out through the read path rather than eyeballing the Langfuse UI, which shows
+the child generation's input/output either way and would never have surfaced the gap. Live-verified
+end to end: a real request through `agent-harness` produced a trace correctly tagged and readable
+with populated `input`/`output`; `nightly_sample.py` correctly filtered to it, `citation_support`
+correctly returned `None` (no citations on this particular trace — retrieval-service was down at
+the time, a `degraded` run, itself expected) without ever calling the judge, and the Ragas
+judge call for `faithfulness`/`answer_relevancy` hit this dev machine's already-extensively-
+documented `eval-judge` OOM class of finding (`llama-server process has terminated: signal:
+killed`, same signature as this file's own M8 section above) — correctly caught and logged rather
+than crashing the run, because `_score_trace` wraps each judge call in its own try/except, the
+exact same "a degraded judge must not sink the run" resilience `runner.py`'s `run_item` already
+established for the golden-set path — extending it here wasn't optional hardening, a nightly batch
+of up to `--limit` (default 200) traces run back-to-back is *more* exposed to one transient judge
+failure than a single golden-set item is, not less. The report still rendered correctly with `n/a`
+for every field that couldn't be scored, proving the resilience path, not just the happy path.
+
 **Two real, live-tested-only model/library compatibility bugs, neither a code-logic bug**:
 (1) LangChain's `OpenAIEmbeddings` pre-tokenizes input into token-ID arrays by default (real
 OpenAI's embeddings endpoint accepts either form) — Infinity's OpenAI-compatible endpoint only
@@ -402,6 +453,12 @@ services/harness/       LangGraph agent loop (§5.3). M1: one node (`respond`), 
                         `GuardrailEvent` for an ineligible-tenant request); new
                         `AgentState.tools_offered` (accumulated across every `respond` call);
                         `settings.eval_tenant_id_set` (`EVAL_TENANT_IDS` env var, comma-separated).
+                        M8 follow-up: `observability/tracing.py`'s `record_run` now tags every
+                        trace `agent:{agent_id}`/`tenant:{tenant_id}` and carries `cited_chunks`
+                        (chunk_id/source_uri/content) in trace metadata, for every run — the read
+                        side lives in `services/eval`'s new §13.9 nightly sampler, see that
+                        milestone's own follow-up paragraph above for the real bug this surfaced
+                        (`trace.input`/`.output` weren't being set on the trace itself).
 services/gateway/       Public entrypoint (§5.2). M1: idempotency (§23.2b pattern) + proxy to
                         harness. JWT re-verified independently of Kong (§8.4's "no service
                         trusts its caller" principle applied one hop earlier). M2:
@@ -555,6 +612,17 @@ services/eval/          M8, entirely new: §13's eval pipeline — a CLI tool (`
                         `asyncio.Semaphore`, a judge failure on one item never crashes the run — see
                         the M8 status paragraph above); `run.py`/`gate.py`/`report.py` — the three
                         CLI entrypoints, deliberately separate so re-gating never re-invokes the LLM.
+                        M8 follow-up (§13.9): `clients/langfuse.py` (`LangfuseClient.
+                        fetch_recent_traces` — reads via Langfuse's public API/SDK, never
+                        ClickHouse directly, see that milestone's own follow-up paragraph above for
+                        why); `metrics/citation_support.py` (`CitationSupportJudge` — a hand-rolled
+                        per-citation judge call, not Ragas, sharing `eval.judge_cache` but never
+                        importing `JudgeRunner`); `nightly_sample.py` (`run_nightly_sample` — the
+                        actual "Full + 200 sampel trace produksi + citation_support" §13.6 always
+                        specified for the `nightly` tier, as its own CLI/`make eval-nightly-sample`
+                        rather than folded into `run.py`'s tier machinery, since it scores a
+                        fundamentally different shape of input than a golden-set item; writes a
+                        report under `reports/`, never `eval.items`/`golden_set.yaml`).
 tests/security/         RLS / tenant isolation — testcontainers, spins up a real pgvector
                         postgres per session, runs every migration, connects as agent_app.
 tests/conformance/       M5b: `test_policy_resolver.py` — ADR-008's interface-only conformance

@@ -50,6 +50,14 @@ class Settings(BaseSettings):
         Path(__file__).resolve().parents[4] / "seed" / "eval" / "golden_set.yaml"
     )
 
+    # §13.9 — nightly-tier production sampling reads traces back out of
+    # the same Langfuse project `services/harness` writes to. Field names
+    # and defaults deliberately match `harness.config.Settings` — same
+    # project, same credentials, run from localhost instead of in-cluster.
+    langfuse_host: str = "http://localhost:3000"
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+
     reports_dir: Path = Path("reports")
 
     log_level: str = "INFO"

@@ -34,6 +34,11 @@ dependencies = [
     # the whole langchain-core/-community family on the 0.2.x/0.3.x line
     # ragas 0.2.15 was actually built against.
     "langchain-openai>=0.2,<0.3",
+    # §13.9 — reads production traces back out of Langfuse for the
+    # nightly-tier sampler (clients/langfuse.py). Same pin as
+    # services/harness (the writer side) so both speak the same API
+    # version against the same Langfuse instance.
+    "langfuse>=2.50,<3",
 ]
 
 [tool.uv.sources]

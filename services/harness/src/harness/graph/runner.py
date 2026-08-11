@@ -186,6 +186,16 @@ async def run_agent(
                 scope_satisfied=authz_record.scope_satisfied,
             )
 
+    chunk_content_by_id = {c.chunk_id: c.content for c in result_state["retrieved_chunks"]}
+    cited_chunks = [
+        {
+            "chunk_id": citation.chunk_id,
+            "source_uri": citation.source_uri,
+            "content": chunk_content_by_id.get(citation.chunk_id, ""),
+        }
+        for citation in citations
+    ]
+
     record_run(
         langfuse,
         trace_id=request.trace_id,
@@ -199,6 +209,7 @@ async def run_agent(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cache_hit=cache_hit,
+        cited_chunks=cited_chunks,
     )
 
     return AgentInvokeResponse(

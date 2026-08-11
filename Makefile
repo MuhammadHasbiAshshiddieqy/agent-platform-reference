@@ -105,6 +105,17 @@ eval-full: ## eval tier full (§13.6/§13.8) — run + gate against the live sta
 eval-report: ## render the last eval-smoke run's report (markdown + JSON under reports/)
 	$(EVAL_ENV) uv run --package eval-service python -m eval_service.report --tier smoke
 
+# §13.9 — nightly-tier production trace sampling, run standalone (never
+# from CI — this reads real Langfuse traffic, not the golden set).
+# AGENT_ID overridable: `make eval-nightly-sample AGENT_ID=hr-assistant`.
+AGENT_ID ?= hr-assistant
+.PHONY: eval-nightly-sample
+eval-nightly-sample: ## sample recent production traces from Langfuse, surface lowest-scoring N for human review (never auto-added to the golden set)
+	$(EVAL_ENV) \
+	LANGFUSE_PUBLIC_KEY="$$(grep ^LANGFUSE_INIT_PROJECT_PUBLIC_KEY .env | cut -d= -f2)" \
+	LANGFUSE_SECRET_KEY="$$(grep ^LANGFUSE_INIT_PROJECT_SECRET_KEY .env | cut -d= -f2)" \
+		uv run --package eval-service python -m eval_service.nightly_sample --agent-id $(AGENT_ID)
+
 .PHONY: logs
 logs: ## follow logs for all running services
 	$(COMPOSE) logs -f
